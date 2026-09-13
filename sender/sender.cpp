@@ -1,3 +1,7 @@
+#include <asio.hpp>
+
+#include "netint.h"
+
 #define MA_IMPLEMENTATION
 #include <miniaudio.h>
 
@@ -12,10 +16,6 @@
 #include <string>
 #include <thread>
 #include <vector>
- 
-#include <asio.hpp>
-
-#include "netint.h"
 
 using Clock = std::chrono::steady_clock;
 using asio::ip::udp;
