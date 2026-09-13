@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 4.0)
+cmake_minimum_required(VERSION 3.21)
 
 project(puma VERSION 1.0 LANGUAGES CXX)
 
