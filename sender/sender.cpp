@@ -54,8 +54,7 @@ void data_callback(ma_device* device, void* output, const void* input, ma_uint32
  
     const std::uint32_t seq = ctx->sequence++;
     const std::uint32_t n   = frameCount;
-    const std::uint64_t ts  = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(now - ctx->origin).count());
+    const std::uint64_t ts  = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
  
     std::memcpy(slot->data.data() +  0, &seq, 4);
     std::memcpy(slot->data.data() +  4, &n,   4);
