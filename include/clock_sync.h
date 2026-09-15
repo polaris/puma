@@ -3,14 +3,13 @@
 
 #include "netint.h"
 #include "sync_message.h"
+#include "clock_helper.h"
 
 #include <asio.hpp>
 #include <chrono>
 #include <optional>
 
 namespace clocksync {
-
-using Clock = std::chrono::steady_clock;
 
 enum class Role { Master, Slave };
 

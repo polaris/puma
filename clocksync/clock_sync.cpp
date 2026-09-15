@@ -5,22 +5,6 @@
 
 namespace clocksync {
 
-std::uint64_t nowNanos() noexcept {
-    return static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            Clock::now().time_since_epoch()).count());
-}
-
-std::uint64_t toNanos(Clock::time_point tp) noexcept {
-    return static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            tp.time_since_epoch()).count());
-}
-
-constexpr double toSeconds(std::chrono::nanoseconds d) noexcept {
-    return std::chrono::duration<double>(d).count();
-}
-
 ClockSync::ClockSync(Config config, Role role)
 : socket_{io_}, timer_{io_}, config_{config}, role_{role}, deadline_{Clock::now()}, sequence_{0}, delayReqSeq_{0}, t1_{0}, t2_{0}, t3_{0} {
     net::configureBidirectional(socket_, config.group, config.iface, {.hops = 1, .loopback = config.loopback});
