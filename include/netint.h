@@ -49,6 +49,11 @@ void configureReceiver(asio::ip::udp::socket& socket,
                        const asio::ip::udp::endpoint& group,
                        const Interface& iface);
 
+void configureBidirectional(asio::ip::udp::socket& socket,
+                            const asio::ip::udp::endpoint& group,
+                            const Interface& iface,
+                            const MulticastOptions& options = {});
+
 }  // namespace net
 
 #endif  // NET_NETINT_H

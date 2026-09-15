@@ -158,4 +158,14 @@ void configureReceiver(asio::ip::udp::socket& socket,
         asio::ip::multicast::join_group(group.address().to_v4(), iface.address));
 }
 
+void configureBidirectional(asio::ip::udp::socket& socket,
+                            const asio::ip::udp::endpoint& group,
+                            const Interface& iface,
+                            const MulticastOptions& options) {
+    configureReceiver(socket, group, iface);
+    socket.set_option(asio::ip::multicast::outbound_interface(iface.address));
+    socket.set_option(asio::ip::multicast::hops(options.hops));
+    socket.set_option(asio::ip::multicast::enable_loopback(options.loopback));
+}
+
 }  // namespace net

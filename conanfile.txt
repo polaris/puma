@@ -2,6 +2,7 @@
 catch2/3.15.3
 asio/1.38.2
 miniaudio/0.11.22
+cli11/2.6.2
 
 [generators]
 CMakeDeps
