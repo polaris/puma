@@ -2,17 +2,32 @@
 #include "byte_order.h"
 
 #include <iostream>
+#include <pthread.h>
 
 namespace clocksync {
 
 ClockSync::ClockSync(Config config, Role role)
-: socket_{io_}, timer_{io_}, config_{config}, role_{role}, deadline_{Clock::now()}, sequence_{0}, delayReqSeq_{0}, t1_{0}, t2_{0}, t3_{0} {
+: socket_{io_}
+, timer_{io_}
+, config_{config}
+, role_{role}
+, deadline_{Clock::now()}
+, sequence_{0}
+, seq_{0}
+, localRef_{0}
+, masterRef_{0}
+, skew_{0}
+, unmatched_{0}
+, noSync_{0}
+, staleSync_{0} {
     net::configureBidirectional(socket_, config.group, config.iface, {.hops = 1, .loopback = config.loopback});
 }
 
 void ClockSync::start() {
+    if (worker_.joinable()) {
+        return;
+    }
     deadline_ = Clock::now();
-    delayReqSeq_ = 0;
     sequence_ = 0;
     armReceive();
     if (role_ == Role::Master) {
@@ -21,6 +36,7 @@ void ClockSync::start() {
         armDelayReqTimer();
     }
     worker_ = std::thread([this] () {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
         io_.run();
     });
 }
@@ -73,9 +89,11 @@ void ClockSync::updateMapping(double localRef, double masterRef, double skew) {
 }
 
 [[nodiscard]] State ClockSync::state() const noexcept {
+    return State{};
 }
 
 [[nodiscard]] Stats ClockSync::stats() const noexcept {
+    return Stats{};
 }
 
 void ClockSync::sendMessage(const SyncMessage& msg) {
@@ -116,23 +134,46 @@ void ClockSync::handleReceive(std::size_t n, Clock::time_point t) {
                 .targetId = msg->nodeId,
                 .seq = sequence_++,
                 .refSeq = msg->seq,
-                .t = nowNanos(),
+                .t = toNanos(t),
             };
             sendMessage(out);
         }
     } else {
         if (msg->type == MsgType::DelayResp) {
-            if (msg->targetId == config_.nodeId && msg->refSeq == delayReqSeq_) {
-                const auto t4 = std::chrono::nanoseconds{static_cast<std::int64_t>(msg->t)};
-                const auto a = t2_ - t1_;              // d + θ
-                const auto b = t4 - t3_;              // d − θ
-                const auto offset = (a - b) / 2;
-                const auto delay  = (a + b) / 2;
-                std::cout << toSeconds(offset) << " " << toSeconds(delay) << "\n";
+            if (msg->targetId != config_.nodeId) {
+                return;
             }
+
+            if (!pending_.valid || msg->refSeq != pending_.seq) {
+                unmatched_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            pending_.valid = false;     
+
+            if (!lastSync_.valid) {
+                noSync_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+
+            const auto age = sinceEpoch(t) - lastSync_.t2;
+            if (age > 2 * std::chrono::duration_cast<std::chrono::nanoseconds>(config_.syncInterval)) {
+                staleSync_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+
+            const auto t4 = std::chrono::nanoseconds{static_cast<std::int64_t>(msg->t)};
+            const auto a  = lastSync_.t2 - lastSync_.t1;
+            const auto b  = t4 - pending_.t3;
+
+            const auto offset = (a - b) / 2;
+            const auto delay  = (a + b) / 2;
+            std::cout << msg->refSeq << " " << a << " " << b << " " << toSeconds(offset) << " " << toSeconds(delay) << " " << toSeconds(age) << "\n";
         } else if (msg->type == MsgType::Sync) {
-            t1_ = std::chrono::nanoseconds{static_cast<std::int64_t>(msg->t)};
-            t2_ = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch());
+            lastSync_ = {
+                .t1 = std::chrono::nanoseconds{static_cast<std::int64_t>(msg->t)},
+                .t2 = sinceEpoch(t),
+                .valid = true
+            };
         }
     }
 }
@@ -148,12 +189,13 @@ void ClockSync::armSyncTimer() {
 }
 
 void ClockSync::sendSync() {
+    const auto t = Clock::now();
     SyncMessage msg{
         .type = MsgType::Sync,
         .domain = config_.domain,
         .nodeId = config_.nodeId,
         .seq = sequence_++,
-        .t = nowNanos(),
+        .t = toNanos(t),
     };
     sendMessage(msg);
 }
@@ -169,15 +211,19 @@ void ClockSync::armDelayReqTimer() {
 }
 
 void ClockSync::sendDelayReq() {
+    const auto t = Clock::now();
     SyncMessage msg{
         .type = MsgType::DelayReq,
         .domain = config_.domain,
         .nodeId = config_.nodeId,
         .seq = sequence_++,
-        .t = nowNanos(),
+        .t = toNanos(t),
     };
-    delayReqSeq_ = msg.seq;
-    t3_ = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch());
+    pending_ = {
+        .t3 = sinceEpoch(t),
+        .seq = msg.seq,
+        .valid = true
+    };
     sendMessage(msg);
 }
 

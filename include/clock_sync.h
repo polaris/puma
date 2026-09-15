@@ -42,6 +42,18 @@ struct State {
     double holdoverAge = 0;  // seconds since last update
 };
 
+struct SyncPair {                       // from the most recent Sync
+    std::chrono::nanoseconds t1{};      // master's send time
+    std::chrono::nanoseconds t2{};      // our arrival time
+    bool valid = false;
+};
+
+struct PendingRequest {                 // the DelayReq we are waiting on
+    std::chrono::nanoseconds t3{};      // our send time
+    std::uint32_t seq = 0;
+    bool valid = false;
+};
+
 class ClockSync {
 public:
     ClockSync(Config config, Role role);           // Role::Master or Role::Slave
@@ -71,9 +83,10 @@ private:
     asio::ip::udp::endpoint remote_;
     std::array<std::uint8_t, 64> buffer_;
 
-    std::size_t delayReqSeq_;
+    SyncPair lastSync_;
+    PendingRequest pending_;
 
-    std::chrono::nanoseconds t1_, t2_, t3_;
+    std::atomic<std::uint64_t> unmatched_, noSync_, staleSync_;
 
     void sendMessage(const SyncMessage& msg);
 

@@ -8,11 +8,11 @@ int main(int argc, char** argv) {
     CLI::App app{"Clock sync demo"};
     argv = app.ensure_utf8(argv);  // proper Unicode handling on Windows
 
-    std::string interface;
+    std::string ifName;
     uint64_t nodeId = 0;
     clocksync::Role role{clocksync::Role::Master};
 
-    app.add_option("-i,--interface", interface, "Network interface");
+    app.add_option("-i,--interface", ifName, "Network interface");
     app.add_option("-n,--nodeid", nodeId, "Node ID")
         ->check(CLI::PositiveNumber);
     std::map<std::string, clocksync::Role> map{{"master", clocksync::Role::Master}, {"slave", clocksync::Role::Slave}};
@@ -29,17 +29,17 @@ int main(int argc, char** argv) {
         if (!i.description.empty()) std::cout << "  (" << i.description << ")";
         std::cout << "\n";
     }
-    const auto chosen = argc > 1 ? net::find(interface) : net::selectDefault();
+    const auto chosen = ifName.empty() ? net::find(ifName) : net::selectDefault();
     if (!chosen) {
-        std::cerr << (argc > 1 ? "no such interface\n"
-                               : "ambiguous or none; name one explicitly\n");
+        std::cerr << (ifName.empty() ? "no such interface\n"
+                                        : "ambiguous or none; name one explicitly\n");
         return 1;
     }
     std::cout << "using " << chosen->name << " " << chosen->address.to_string() << "\n";
 
     clocksync::Config config{
         .iface = *chosen,
-        .group = asio::ip::udp::endpoint(asio::ip::make_address("239.255.0.2"), 12345),
+        .group = asio::ip::udp::endpoint(asio::ip::make_address("239.255.0.2"), 12346),
         .nodeId = nodeId,
     };
     clocksync::ClockSync cs{config, role};

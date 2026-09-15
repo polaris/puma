@@ -18,6 +18,10 @@ inline std::uint64_t toNanos(Clock::time_point tp) noexcept {
             tp.time_since_epoch()).count());
 }
 
+inline std::chrono::nanoseconds sinceEpoch(Clock::time_point tp) noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(tp.time_since_epoch());
+}
+
 constexpr double toSeconds(std::chrono::nanoseconds d) noexcept {
     return std::chrono::duration<double>(d).count();
 }
