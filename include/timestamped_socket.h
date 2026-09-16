@@ -3,6 +3,7 @@
 
 #include <asio.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -18,46 +19,86 @@ struct RxResult {
     bool kernelStamp = false;   ///< false => stamp was taken in userspace
 };
 
+/// Which timestamp source is currently in use.
+enum class StampMode {
+    Userspace,   ///< kernel timestamps unavailable, or rejected by probation
+    Probation,   ///< kernel stamps are being validated; userspace still in use
+    Kernel,      ///< validated, kernel stamps in use
+};
+
 /// Reads datagrams with the best receive timestamp the platform offers.
 ///
-/// asio is still used for readiness (async_wait) and for socket lifetime; the
-/// read itself goes through recvmsg / WSARecvMsg so the ancillary data carrying
-/// the kernel timestamp is reachable.
+/// asio provides readiness (async_wait) and socket lifetime; the read goes
+/// through recvmsg / WSARecvMsg so the ancillary data carrying the kernel
+/// timestamp is reachable.
 ///
-/// If kernel timestamping is unavailable the class still works: `stamp` is then
-/// taken in userspace immediately after the read returns and `kernelStamp` is
-/// false. Report that flag: a pair of nodes where only one side has kernel
-/// timestamps has a structurally asymmetric path, which biases the offset.
+/// Two things this class deliberately does NOT assume, both of which turned out
+/// to be false in practice:
+///
+///  * that the kernel timestamp shares steady_clock's epoch. On macOS the
+///    socket stamp is mach_absolute_time while libc++'s steady_clock is
+///    CLOCK_MONOTONIC_RAW, and those differ by accumulated sleep time. On Linux
+///    the stamp is CLOCK_REALTIME. The offset is measured, not assumed.
+///
+///  * that the kernel timestamp advances at the same rate as steady_clock. A
+///    NIC providing a hardware timestamp reports its own clock at its own
+///    frequency. A probation phase checks this against live traffic before the
+///    stamps are trusted, and falls back to userspace if they misbehave.
 class TimestampedReceiver {
 public:
     explicit TimestampedReceiver(asio::ip::udp::socket& socket);
 
-    /// Ask the kernel to stamp incoming datagrams.
-    /// Returns false if the platform or the NIC driver does not support it;
-    /// that is not an error, it selects the userspace fallback.
+    /// Ask the kernel to stamp incoming datagrams. Returns false if the
+    /// platform or the NIC driver does not support it. Returning true means the
+    /// option was accepted, not that the stamps are usable: the first
+    /// kProbeCount datagrams validate them while userspace stamps are still
+    /// what gets reported.
     bool enableKernelTimestamps();
 
-    [[nodiscard]] bool kernelTimestamps() const noexcept { return enabled_; }
+    [[nodiscard]] StampMode mode() const noexcept { return mode_; }
+    [[nodiscard]] bool kernelTimestamps() const noexcept {
+        return mode_ == StampMode::Kernel;
+    }
 
-    /// One non-blocking read. On success ec is cleared and bytes > 0.
-    /// ec == asio::error::would_block means the socket was not actually
-    /// readable, which async_wait can report; the caller should just re-arm.
+    /// Median (userspace stamp - kernel stamp) measured during probation: the
+    /// receive-path latency that kernel timestamping removes.
+    [[nodiscard]] std::chrono::nanoseconds kernelLag() const noexcept { return kernelLag_; }
+
+    /// Why probation rejected the stamps, or "" if it did not.
+    [[nodiscard]] const char* rejectReason() const noexcept { return rejectReason_; }
+
+    /// One non-blocking read. On success ec is cleared and bytes > 0. Any error
+    /// (including would-block, which async_wait can produce) means "no
+    /// datagram"; the caller should simply re-arm.
     RxResult receive(std::span<std::uint8_t> buffer, asio::error_code& ec);
 
 private:
-    asio::ip::udp::socket& socket_;
-    bool enabled_ = false;
+    static constexpr std::size_t kProbeCount = 16;
 
-    /// Convert a platform-native raw timestamp into the steady_clock domain.
-    std::chrono::steady_clock::time_point convert(std::uint64_t raw);
+    /// Raw platform timestamp -> nanoseconds in the raw clock's own domain.
+    [[nodiscard]] std::chrono::nanoseconds rawToNanos(std::uint64_t raw) const;
 
-#if defined(__linux__)
-    // Linux software timestamps are CLOCK_REALTIME; steady_clock is
-    // CLOCK_MONOTONIC. Keep a periodically refreshed offset between them.
+    /// Measure (steady_clock - raw clock) so converted stamps land in the
+    /// steady_clock domain. Re-sampled periodically: on macOS this offset moves
+    /// whenever the machine sleeps.
     void refreshClockOffset();
-    std::chrono::nanoseconds realtimeToMonotonic_{0};
+
+    [[nodiscard]] std::chrono::steady_clock::time_point convert(std::uint64_t raw);
+
+    void addProbe(std::chrono::nanoseconds lag);
+    void decideMode();
+
+    asio::ip::udp::socket& socket_;
+    StampMode mode_ = StampMode::Userspace;
+    const char* rejectReason_ = "";
+
+    std::chrono::nanoseconds clockOffset_{0};
     std::chrono::steady_clock::time_point offsetSampledAt_{};
-#endif
+
+    std::array<std::chrono::nanoseconds, kProbeCount> probes_{};
+    std::size_t probeCount_ = 0;
+    std::chrono::nanoseconds kernelLag_{0};
+
 #if defined(__APPLE__)
     std::uint64_t machNumer_ = 1, machDenom_ = 1;
 #endif

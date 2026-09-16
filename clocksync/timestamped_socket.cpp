@@ -1,5 +1,7 @@
 #include "timestamped_socket.h"
 
+#include <algorithm>
+#include <vector>
 #include <cstring>
 
 #if defined(_WIN32)
@@ -34,9 +36,15 @@ asio::ip::udp::endpoint toEndpoint(const sockaddr_storage& ss) {
     return {asio::ip::address_v4(bytes), ntohs(sin->sin_port)};
 }
 
-/// Space for the ancillary data. Generous: the largest payload we look for is
-/// a timespec, and over-allocating costs nothing.
+/// Space for the ancillary data. Generous; over-allocating costs nothing.
 constexpr std::size_t kControlBytes = 256;
+
+/// Probation thresholds. The lag is the receive-path latency, so it must be
+/// positive and of a plausible magnitude, and it must not trend: a trend means
+/// the kernel clock runs at a different rate from steady_clock.
+constexpr auto kMinLag   = std::chrono::microseconds{-200};
+constexpr auto kMaxLag   = std::chrono::milliseconds{50};
+constexpr auto kMaxDrift = std::chrono::milliseconds{1};
 
 }  // namespace
 
@@ -59,21 +67,24 @@ TimestampedReceiver::TimestampedReceiver(asio::ip::udp::socket& socket)
 // ---------------------------------------------------------------------------
 
 bool TimestampedReceiver::enableKernelTimestamps() {
-    enabled_ = false;
+    mode_ = StampMode::Userspace;
+    rejectReason_ = "";
+    probeCount_ = 0;
 
 #if defined(__APPLE__)
     int on = 1;
     if (::setsockopt(socket_.native_handle(), SOL_SOCKET, SO_TIMESTAMP_MONOTONIC,
-                     &on, sizeof(on)) == 0) {
-        enabled_ = true;
+                     &on, sizeof(on)) != 0) {
+        rejectReason_ = "setsockopt(SO_TIMESTAMP_MONOTONIC) failed";
+        return false;
     }
 
 #elif defined(__linux__)
     int on = 1;
     if (::setsockopt(socket_.native_handle(), SOL_SOCKET, SO_TIMESTAMPNS,
-                     &on, sizeof(on)) == 0) {
-        refreshClockOffset();
-        enabled_ = true;
+                     &on, sizeof(on)) != 0) {
+        rejectReason_ = "setsockopt(SO_TIMESTAMPNS) failed";
+        return false;
     }
 
 #elif defined(_WIN32)
@@ -84,6 +95,7 @@ bool TimestampedReceiver::enableKernelTimestamps() {
     if (::WSAIoctl(socket_.native_handle(), SIO_GET_EXTENSION_FUNCTION_POINTER,
                    &guid, sizeof(guid), &fn, sizeof(fn),
                    &returned, nullptr, nullptr) == SOCKET_ERROR) {
+        rejectReason_ = "WSARecvMsg lookup failed";
         return false;
     }
     recvMsgFn_ = reinterpret_cast<void*>(fn);
@@ -96,56 +108,120 @@ bool TimestampedReceiver::enableKernelTimestamps() {
                    &cfg, sizeof(cfg), nullptr, 0,
                    &bytes, nullptr, nullptr) == SOCKET_ERROR) {
         // WSAEOPNOTSUPP (10045): the NIC driver does not expose timestamping.
+        rejectReason_ = "SIO_TIMESTAMPING not supported by this NIC";
         return false;
     }
-    enabled_ = true;
+
+#else
+    rejectReason_ = "no kernel timestamping on this platform";
+    return false;
 #endif
 
-    return enabled_;
+    refreshClockOffset();
+    mode_ = StampMode::Probation;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
 
-#if defined(__linux__)
-void TimestampedReceiver::refreshClockOffset() {
-    timespec r{}, m{};
-    ::clock_gettime(CLOCK_REALTIME, &r);
-    ::clock_gettime(CLOCK_MONOTONIC, &m);
-    const auto realtime  = std::chrono::seconds{r.tv_sec} + std::chrono::nanoseconds{r.tv_nsec};
-    const auto monotonic = std::chrono::seconds{m.tv_sec} + std::chrono::nanoseconds{m.tv_nsec};
-    realtimeToMonotonic_ =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(monotonic - realtime);
-    offsetSampledAt_ = Clock::now();
-}
-#endif
-
-std::chrono::steady_clock::time_point
-TimestampedReceiver::convert(std::uint64_t raw) {
+std::chrono::nanoseconds TimestampedReceiver::rawToNanos(std::uint64_t raw) const {
 #if defined(__APPLE__)
-    // raw is mach_absolute_time ticks; steady_clock uses the same timebase.
-    const std::uint64_t ns = raw * machNumer_ / machDenom_;
-    return Clock::time_point{std::chrono::nanoseconds{static_cast<std::int64_t>(ns)}};
+    // mach_absolute_time ticks
+    return std::chrono::nanoseconds{
+        static_cast<std::int64_t>(raw * machNumer_ / machDenom_)};
 
 #elif defined(__linux__)
-    // raw is CLOCK_REALTIME nanoseconds; shift into CLOCK_MONOTONIC.
-    if (Clock::now() - offsetSampledAt_ > std::chrono::seconds{2}) refreshClockOffset();
-    const auto realtime = std::chrono::nanoseconds{static_cast<std::int64_t>(raw)};
-    return Clock::time_point{realtime + realtimeToMonotonic_};
+    // already nanoseconds, in CLOCK_REALTIME
+    return std::chrono::nanoseconds{static_cast<std::int64_t>(raw)};
 
 #elif defined(_WIN32)
-    // raw is QPC ticks; MSVC's steady_clock is QPC-based.
-    // Split into whole seconds and remainder to avoid overflowing 64 bits, as
-    // MSVC's own steady_clock::now() does.
-    if (qpcFrequency_ == 0) return Clock::now();
+    // QPC ticks. Split into whole seconds and remainder so the intermediate
+    // product cannot overflow 64 bits.
+    if (qpcFrequency_ == 0) return std::chrono::nanoseconds{0};
     const auto ticks = static_cast<std::int64_t>(raw);
     const auto ns = (ticks / qpcFrequency_) * 1'000'000'000LL +
                     (ticks % qpcFrequency_) * 1'000'000'000LL / qpcFrequency_;
-    return Clock::time_point{std::chrono::nanoseconds{ns}};
+    return std::chrono::nanoseconds{ns};
 
 #else
     (void)raw;
-    return Clock::now();
+    return std::chrono::nanoseconds{0};
 #endif
+}
+
+void TimestampedReceiver::refreshClockOffset() {
+    // Read both clocks as close together as possible, then take the difference.
+    // Whatever the raw clock's epoch is, this puts converted stamps into the
+    // steady_clock domain.
+    std::uint64_t raw = 0;
+
+#if defined(__APPLE__)
+    raw = mach_absolute_time();
+#elif defined(__linux__)
+    timespec r{};
+    ::clock_gettime(CLOCK_REALTIME, &r);
+    raw = static_cast<std::uint64_t>(r.tv_sec) * 1'000'000'000ull +
+          static_cast<std::uint64_t>(r.tv_nsec);
+#elif defined(_WIN32)
+    LARGE_INTEGER qpc{};
+    QueryPerformanceCounter(&qpc);
+    raw = static_cast<std::uint64_t>(qpc.QuadPart);
+#endif
+
+    const auto steady = Clock::now();
+    clockOffset_ = steady.time_since_epoch() - rawToNanos(raw);
+    offsetSampledAt_ = steady;
+}
+
+std::chrono::steady_clock::time_point
+TimestampedReceiver::convert(std::uint64_t raw) {
+    if (Clock::now() - offsetSampledAt_ > std::chrono::seconds{2}) {
+        refreshClockOffset();
+    }
+    return Clock::time_point{rawToNanos(raw) + clockOffset_};
+}
+
+// ---------------------------------------------------------------------------
+
+void TimestampedReceiver::addProbe(std::chrono::nanoseconds lag) {
+    probes_[probeCount_++] = lag;
+    if (probeCount_ == kProbeCount) decideMode();
+}
+
+void TimestampedReceiver::decideMode() {
+    auto median = [](auto first, auto last) {
+        std::vector<std::chrono::nanoseconds> v(first, last);
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+
+    const auto half = probes_.begin() + kProbeCount / 2;
+    const auto all    = median(probes_.begin(), probes_.begin() + kProbeCount);
+    const auto first  = median(probes_.begin(), half);
+    const auto second = median(half, probes_.begin() + kProbeCount);
+    const auto drift  = second - first;
+
+    kernelLag_ = all;
+
+    if (all < kMinLag) {
+        rejectReason_ = "kernel stamp is ahead of the userspace stamp "
+                        "(clock domains differ)";
+        mode_ = StampMode::Userspace;
+        return;
+    }
+    if (all > kMaxLag) {
+        rejectReason_ = "kernel stamp lags implausibly far behind "
+                        "(clock domains differ)";
+        mode_ = StampMode::Userspace;
+        return;
+    }
+    if (drift > kMaxDrift || drift < -kMaxDrift) {
+        rejectReason_ = "kernel clock runs at a different rate from steady_clock";
+        mode_ = StampMode::Userspace;
+        return;
+    }
+
+    mode_ = StampMode::Kernel;
 }
 
 // ---------------------------------------------------------------------------
@@ -174,7 +250,8 @@ RxResult TimestampedReceiver::receive(std::span<std::uint8_t> buffer,
     const ssize_t n = ::recvmsg(socket_.native_handle(), &msg, 0);
 
     // Userspace fallback timestamp, taken as early as possible.
-    out.stamp = Clock::now();
+    const auto userStamp = Clock::now();
+    out.stamp = userStamp;
 
     if (n < 0) {
         ec = asio::error_code(errno, asio::error::get_system_category());
@@ -184,28 +261,39 @@ RxResult TimestampedReceiver::receive(std::span<std::uint8_t> buffer,
     out.bytes = static_cast<std::size_t>(n);
     out.from  = toEndpoint(src);
 
+    if (mode_ == StampMode::Userspace) return out;
+
     for (cmsghdr* c = CMSG_FIRSTHDR(&msg); c != nullptr; c = CMSG_NXTHDR(&msg, c)) {
         if (c->cmsg_level != SOL_SOCKET) continue;
 
+        std::uint64_t raw = 0;
+        bool found = false;
+
 #if defined(__APPLE__)
         if (c->cmsg_type == SCM_TIMESTAMP_MONOTONIC) {
-            std::uint64_t ticks = 0;
-            std::memcpy(&ticks, CMSG_DATA(c), sizeof(ticks));
-            out.stamp = convert(ticks);
-            out.kernelStamp = true;
-            break;
+            std::memcpy(&raw, CMSG_DATA(c), sizeof(raw));
+            found = true;
         }
 #elif defined(__linux__)
         if (c->cmsg_type == SCM_TIMESTAMPNS) {
             timespec ts{};
             std::memcpy(&ts, CMSG_DATA(c), sizeof(ts));
-            const auto ns = static_cast<std::uint64_t>(ts.tv_sec) * 1'000'000'000ull +
-                            static_cast<std::uint64_t>(ts.tv_nsec);
-            out.stamp = convert(ns);
-            out.kernelStamp = true;
-            break;
+            raw = static_cast<std::uint64_t>(ts.tv_sec) * 1'000'000'000ull +
+                  static_cast<std::uint64_t>(ts.tv_nsec);
+            found = true;
         }
 #endif
+        if (!found) continue;
+
+        const auto kernelStamp = convert(raw);
+        if (mode_ == StampMode::Probation) {
+            // Validate before trusting: keep reporting the userspace stamp.
+            addProbe(userStamp - kernelStamp);
+        } else {
+            out.stamp = kernelStamp;
+            out.kernelStamp = true;
+        }
+        break;
     }
     return out;
 }
@@ -217,7 +305,6 @@ RxResult TimestampedReceiver::receive(std::span<std::uint8_t> buffer,
     RxResult out;
 
     if (recvMsgFn_ == nullptr) {
-        // Kernel timestamping was never enabled; fall back to a plain read.
         out.bytes = socket_.receive_from(asio::buffer(buffer.data(), buffer.size()),
                                          out.from, 0, ec);
         out.stamp = Clock::now();
@@ -246,7 +333,8 @@ RxResult TimestampedReceiver::receive(std::span<std::uint8_t> buffer,
     const int rc = WSARecvMsgFn(socket_.native_handle(), &msg, &received,
                                 nullptr, nullptr);
 
-    out.stamp = Clock::now();
+    const auto userStamp = Clock::now();
+    out.stamp = userStamp;
 
     if (rc == SOCKET_ERROR) {
         ec = asio::error_code(::WSAGetLastError(), asio::error::get_system_category());
@@ -256,13 +344,20 @@ RxResult TimestampedReceiver::receive(std::span<std::uint8_t> buffer,
     out.bytes = received;
     out.from  = toEndpoint(src);
 
+    if (mode_ == StampMode::Userspace) return out;
+
     for (WSACMSGHDR* c = WSA_CMSG_FIRSTHDR(&msg); c != nullptr;
          c = WSA_CMSG_NXTHDR(&msg, c)) {
         if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SO_TIMESTAMP) {
-            UINT64 ticks = 0;
-            std::memcpy(&ticks, WSA_CMSG_DATA(c), sizeof(ticks));
-            out.stamp = convert(ticks);
-            out.kernelStamp = true;
+            UINT64 raw = 0;
+            std::memcpy(&raw, WSA_CMSG_DATA(c), sizeof(raw));
+            const auto kernelStamp = convert(raw);
+            if (mode_ == StampMode::Probation) {
+                addProbe(userStamp - kernelStamp);
+            } else {
+                out.stamp = kernelStamp;
+                out.kernelStamp = true;
+            }
             break;
         }
     }
