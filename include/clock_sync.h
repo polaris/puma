@@ -5,6 +5,7 @@
 #include "sync_message.h"
 #include "clock_helper.h"
 #include "servo.h"
+#include "timestamped_socket.h"
 
 #include <asio.hpp>
 #include <chrono>
@@ -59,6 +60,7 @@ private:
     asio::io_context io_;
     asio::ip::udp::socket socket_;
     asio::steady_timer timer_;
+    TimestampedReceiver receiver_;
     std::thread worker_;
 
     Config config_;
@@ -77,6 +79,7 @@ private:
     PendingRequest pending_;
 
     std::atomic<std::uint64_t> unmatched_, noSync_, staleSync_;
+    std::atomic<std::uint64_t> userStamps_{0};
 
     Servo servo_;
 

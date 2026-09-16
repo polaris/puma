@@ -27,6 +27,7 @@ void prioritizeCurrentThread() {
 ClockSync::ClockSync(Config config, Role role)
 : socket_{io_}
 , timer_{io_}
+, receiver_{socket_}
 , config_{config}
 , role_{role}
 , deadline_{Clock::now()}
@@ -48,6 +49,9 @@ void ClockSync::start() {
     deadline_ = Clock::now();
     sequence_ = 0;
     servo_.configure(config_.acquireBandwidth, config_.lockBandwidth);
+    socket_.non_blocking(true);
+    const bool k = receiver_.enableKernelTimestamps();
+    std::cerr << "kernel timestamps: " << (k ? "enabled" : "unavailable") << "\n";
     armReceive();
     if (role_ == Role::Master) {
         armSyncTimer();
@@ -124,17 +128,18 @@ void ClockSync::sendMessage(const SyncMessage& msg) {
 }
 
 void ClockSync::armReceive() {
-    socket_.async_receive_from(asio::buffer(buffer_), remote_,
-        [this](const asio::error_code& ec, std::size_t n) {
-            if (ec == asio::error::operation_aborted) {
-                return;
+    socket_.async_wait(asio::ip::udp::socket::wait_read,
+        [this](const asio::error_code& ec) {
+            if (ec == asio::error::operation_aborted) return;
+            if (ec) { armReceive(); return; }
+
+            asio::error_code rec;
+            const auto r = receiver_.receive(std::span{buffer_}, rec);
+            if (!rec && r.bytes > 0) {
+                if (!r.kernelStamp) userStamps_.fetch_add(1, std::memory_order_relaxed);
+                remote_ = r.from;
+                handleReceive(r.bytes, r.stamp);
             }
-            if (ec) {
-                armReceive();
-                return;
-            }
-            const auto t = Clock::now();
-            handleReceive(n, t);
             armReceive();
         });
 }
