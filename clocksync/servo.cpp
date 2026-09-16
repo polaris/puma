@@ -1,4 +1,6 @@
 #include "servo.h"
+#include <algorithm>
+#include <cmath>
 #include <numbers>
 
 Servo::Servo() : state_{}, acquireStart_{0.0} {

@@ -2,9 +2,27 @@
 #include "byte_order.h"
 
 #include <iostream>
+
+#if defined(_WIN32)
+#include <windows.h>
+#elif defined(__APPLE__)
 #include <pthread.h>
+#endif
 
 namespace clocksync {
+namespace {
+
+/// Raise the calling thread to the highest non-realtime priority the platform
+/// offers, so timestamping is not delayed by scheduling jitter.
+void prioritizeCurrentThread() {
+#if defined(_WIN32)
+    ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#elif defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+}
+
+} // namespace
 
 ClockSync::ClockSync(Config config, Role role)
 : socket_{io_}
@@ -37,7 +55,7 @@ void ClockSync::start() {
         armDelayReqTimer();
     }
     worker_ = std::thread([this] () {
-        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        prioritizeCurrentThread();
         io_.run();
     });
 }

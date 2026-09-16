@@ -41,8 +41,8 @@ int main(int argc, char** argv) {
     std::cout << "using " << chosen->name << " " << chosen->address.to_string() << "\n";
 
     clocksync::Config config{
-        .iface = *chosen,
         .group = asio::ip::udp::endpoint(asio::ip::make_address("239.255.0.2"), 12346),
+        .iface = *chosen,
         .nodeId = nodeId,
     };
     clocksync::ClockSync cs{config, role};
