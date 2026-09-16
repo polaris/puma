@@ -16,9 +16,22 @@ namespace clocksync {
 enum class Role { Master, Slave };
 
 struct Stats {
-    double offset;       // master - local, seconds
-    double pathDelay;    // seconds
-    double quality;      // 0..1, 1 is best
+    double offset        = 0.0;   // master - local, seconds
+    double pathDelay     = 0.0;   // rolling minimum one-way delay, seconds
+    double gateThreshold = 0.0;   // current outlier gate, seconds
+    double quality       = 0.0;   // 0..1, 1 is best
+
+    // Which receive timestamps the servo is actually being fed. A pair of nodes
+    // where only one side has kernel stamps is structurally asymmetric, so this
+    // belongs in the diagnostics rather than being inferred from a odd offset.
+    bool   kernelTimestamps = false;
+    double kernelLag        = 0.0;   // seconds of receive-path latency removed
+
+    std::uint64_t rejected  = 0;  // dropped by the delay gate
+    std::uint64_t tooSoon   = 0;  // sample interval implausibly short
+    std::uint64_t unmatched = 0;  // DelayResp with no matching request
+    std::uint64_t noSync    = 0;  // DelayResp before any Sync
+    std::uint64_t staleSync = 0;  // paired Sync too old to use
 };
 
 struct Config {
@@ -79,6 +92,17 @@ private:
     PendingRequest pending_;
 
     std::atomic<std::uint64_t> unmatched_, noSync_, staleSync_;
+
+    // Diagnostics are produced on the io thread and read from whatever thread
+    // calls stats(); mirror them into atomics rather than racing on the Servo
+    // and TimestampedReceiver members directly.
+    std::atomic<double> statPathDelay_{0.0};
+    std::atomic<double> statGate_{0.0};
+    std::atomic<double> statKernelLag_{0.0};
+    std::atomic<std::uint64_t> statRejected_{0};
+    std::atomic<std::uint64_t> statTooSoon_{0};
+    std::atomic<bool> statKernelStamps_{false};
+    bool stampModeReported_ = false;   // io thread only
     std::atomic<std::uint64_t> userStamps_{0};
 
     Servo servo_;
@@ -95,6 +119,8 @@ private:
     void sendDelayReq();
 
     void updateMapping(double localRef, double masterRef, double skew);
+    void publishStats();          // io thread -> the atomics above
+    void reportStampMode();       // one-shot, once probation has settled
 };
 
 }

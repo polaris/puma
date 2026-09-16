@@ -51,7 +51,6 @@ void ClockSync::start() {
     servo_.configure(config_.acquireBandwidth, config_.lockBandwidth);
     socket_.non_blocking(true);
     const bool k = receiver_.enableKernelTimestamps();
-    std::cerr << "kernel timestamps: " << (k ? "enabled" : "unavailable") << "\n";
     armReceive();
     if (role_ == Role::Master) {
         armSyncTimer();
@@ -115,8 +114,54 @@ void ClockSync::updateMapping(double localRef, double masterRef, double skew) {
     return State{};
 }
 
+void ClockSync::reportStampMode() {
+    // enableKernelTimestamps() only reports that the socket option was
+    // accepted. Whether the stamps are usable is decided by probation, which
+    // needs real datagrams, so the answer is only available here.
+    if (stampModeReported_) return;
+    if (receiver_.mode() == StampMode::Probation) return;
+    stampModeReported_ = true;
+
+    const auto lagUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                           receiver_.kernelLag()).count();
+    std::cerr << "timestamps: "
+              << (receiver_.kernelTimestamps() ? "kernel" : "userspace")
+              << "  lag=" << lagUs << " us";
+    if (const char* why = receiver_.rejectReason(); why && *why) {
+        std::cerr << "  (" << why << ")";
+    }
+    std::cerr << "\n";
+}
+
+void ClockSync::publishStats() {
+    statPathDelay_.store(toSeconds(servo_.pathDelay()), std::memory_order_relaxed);
+    statGate_.store(toSeconds(servo_.gateThreshold()), std::memory_order_relaxed);
+    statKernelLag_.store(toSeconds(receiver_.kernelLag()), std::memory_order_relaxed);
+    statRejected_.store(servo_.rejected(), std::memory_order_relaxed);
+    statTooSoon_.store(servo_.tooSoon(), std::memory_order_relaxed);
+    statKernelStamps_.store(receiver_.kernelTimestamps(), std::memory_order_relaxed);
+}
+
 [[nodiscard]] Stats ClockSync::stats() const noexcept {
-    return Stats{};
+    Stats s;
+    if (const auto m = mapping()) {
+        s.offset = m->masterRef - m->localRef;
+    }
+    s.pathDelay       = statPathDelay_.load(std::memory_order_relaxed);
+    s.gateThreshold   = statGate_.load(std::memory_order_relaxed);
+    s.kernelLag       = statKernelLag_.load(std::memory_order_relaxed);
+    s.kernelTimestamps= statKernelStamps_.load(std::memory_order_relaxed);
+    s.rejected        = statRejected_.load(std::memory_order_relaxed);
+    s.tooSoon         = statTooSoon_.load(std::memory_order_relaxed);
+    s.unmatched       = unmatched_.load(std::memory_order_relaxed);
+    s.noSync          = noSync_.load(std::memory_order_relaxed);
+    s.staleSync       = staleSync_.load(std::memory_order_relaxed);
+
+    // Cheap quality proxy until the Kalman filter supplies a covariance:
+    // 1 when locked, decaying as the mapping ages.
+    s.quality = (state().value == State::Locked) ? 1.0
+              : (state().value == State::Acquiring) ? 0.5 : 0.0;
+    return s;
 }
 
 void ClockSync::sendMessage(const SyncMessage& msg) {
@@ -138,6 +183,7 @@ void ClockSync::armReceive() {
             if (!rec && r.bytes > 0) {
                 if (!r.kernelStamp) userStamps_.fetch_add(1, std::memory_order_relaxed);
                 remote_ = r.from;
+                reportStampMode();          // one-shot, once probation settles
                 handleReceive(r.bytes, r.stamp);
             }
             armReceive();
@@ -195,6 +241,7 @@ void ClockSync::handleReceive(std::size_t n, Clock::time_point t) {
             const auto L = (pending_.t3 + lastSync_.t2) / 2;
             const auto M = L - offset;
             servo_.addSample(toSeconds(L), toSeconds(M), delay);
+            publishStats();
 
             const auto mapping = servo_.mapping();
 
@@ -208,7 +255,6 @@ void ClockSync::handleReceive(std::size_t n, Clock::time_point t) {
                           << servo_.tooSoon() << "\n";
             }
 
-            //std::cout << msg->refSeq << " " << a << " " << b << " " << toSeconds(offset) << " " << toSeconds(delay) << " " << toSeconds(age) << "\n";
         } else if (msg->type == MsgType::Sync) {
             lastSync_ = {
                 .t1 = std::chrono::nanoseconds{static_cast<std::int64_t>(msg->t)},
