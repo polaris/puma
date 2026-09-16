@@ -4,6 +4,7 @@
 #include "netint.h"
 #include "sync_message.h"
 #include "clock_helper.h"
+#include "servo.h"
 
 #include <asio.hpp>
 #include <chrono>
@@ -12,12 +13,6 @@
 namespace clocksync {
 
 enum class Role { Master, Slave };
-
-struct ClockMapping {
-    double localRef;     // a local steady_clock instant, seconds
-    double masterRef;    // the master time at that instant
-    double skew;         // master seconds per local second, minus 1
-};
 
 struct Stats {
     double offset;       // master - local, seconds
@@ -31,15 +26,10 @@ struct Config {
     std::uint8_t domain = 0;              // two systems, one LAN, no interference
     std::uint64_t nodeId = 0;             // 0 = generate; used to ignore our own packets
     std::chrono::milliseconds syncInterval{125};        // 8/s
-    std::chrono::milliseconds delayReqInterval{500};    // randomized per node
-    double acquireBandwidth = 1.0;        // Hz
+    std::chrono::milliseconds delayReqInterval{125};    // randomized per node
+    double acquireBandwidth = 0.5;        // Hz
     double lockBandwidth    = 0.05;       // Hz
     bool loopback = true;                 // single-machine testing
-};
-
-struct State {
-    enum Value { Unsynced, Acquiring, Locked, Holdover } value = Unsynced;
-    double holdoverAge = 0;  // seconds since last update
 };
 
 struct SyncPair {                       // from the most recent Sync
@@ -88,6 +78,8 @@ private:
 
     std::atomic<std::uint64_t> unmatched_, noSync_, staleSync_;
 
+    Servo servo_;
+
     void sendMessage(const SyncMessage& msg);
 
     void armReceive();
@@ -101,9 +93,6 @@ private:
 
     void updateMapping(double localRef, double masterRef, double skew);
 };
-
-[[nodiscard]] double localToMaster(double local, const ClockMapping& mapping) noexcept;
-[[nodiscard]] double masterToLocal(double master, const ClockMapping& mapping) noexcept;
 
 }
 

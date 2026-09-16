@@ -5,6 +5,9 @@
 #include <CLI/CLI.hpp>
 
 int main(int argc, char** argv) {
+    std::cout << std::fixed << std::showpoint;
+    std::cout << std::setprecision(5);
+
     CLI::App app{"Clock sync demo"};
     argv = app.ensure_utf8(argv);  // proper Unicode handling on Windows
 

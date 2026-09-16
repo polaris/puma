@@ -29,6 +29,7 @@ void ClockSync::start() {
     }
     deadline_ = Clock::now();
     sequence_ = 0;
+    servo_.configure(config_.acquireBandwidth, config_.lockBandwidth);
     armReceive();
     if (role_ == Role::Master) {
         armSyncTimer();
@@ -167,7 +168,24 @@ void ClockSync::handleReceive(std::size_t n, Clock::time_point t) {
 
             const auto offset = (a - b) / 2;
             const auto delay  = (a + b) / 2;
-            std::cout << msg->refSeq << " " << a << " " << b << " " << toSeconds(offset) << " " << toSeconds(delay) << " " << toSeconds(age) << "\n";
+
+            const auto L = (pending_.t3 + lastSync_.t2) / 2;
+            const auto M = L - offset;
+            servo_.addSample(toSeconds(L), toSeconds(M), delay);
+
+            const auto mapping = servo_.mapping();
+
+            if (mapping) {
+                updateMapping(mapping->localRef, mapping->masterRef, mapping->skew);
+                std::cout << toSeconds(offset) * 1e6 << " "                              // theta_raw, us
+                          << toSeconds(delay)  * 1e6 << " "                              // delay, us
+                          << -(mapping->masterRef - mapping->localRef) * 1e6 << " "      // theta from mapping
+                          << mapping->skew * 1e6 << " "                                  // ppm
+                          << servo_.rejected() << " "                                   // increments on reject
+                          << servo_.tooSoon() << "\n";
+            }
+
+            //std::cout << msg->refSeq << " " << a << " " << b << " " << toSeconds(offset) << " " << toSeconds(delay) << " " << toSeconds(age) << "\n";
         } else if (msg->type == MsgType::Sync) {
             lastSync_ = {
                 .t1 = std::chrono::nanoseconds{static_cast<std::int64_t>(msg->t)},
@@ -225,14 +243,6 @@ void ClockSync::sendDelayReq() {
         .valid = true
     };
     sendMessage(msg);
-}
-
-[[nodiscard]] double localToMaster(double local, const ClockMapping& mapping) noexcept {
-    return mapping.masterRef + (local - mapping.localRef) * (1.0 + mapping.skew);
-}
-
-[[nodiscard]] double masterToLocal(double master, const ClockMapping& mapping) noexcept {
-    return mapping.localRef + (master - mapping.masterRef) / (1.0 + mapping.skew);
 }
 
 }
