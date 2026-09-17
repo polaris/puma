@@ -40,11 +40,30 @@ asio::ip::udp::endpoint toEndpoint(const sockaddr_storage& ss) {
 constexpr std::size_t kControlBytes = 256;
 
 /// Probation thresholds. The lag is the receive-path latency, so it must be
-/// positive and of a plausible magnitude, and it must not trend: a trend means
-/// the kernel clock runs at a different rate from steady_clock.
+/// positive and of a plausible magnitude, and it must not trend grossly. The
+/// drift test only spans 16 datagrams and medians move with load, so it is
+/// kept loose; small rate errors are the job of trackRate().
 constexpr auto kMinLag   = std::chrono::microseconds{-200};
 constexpr auto kMaxLag   = std::chrono::milliseconds{50};
-constexpr auto kMaxDrift = std::chrono::milliseconds{1};
+constexpr auto kMaxDrift = std::chrono::milliseconds{5};
+
+/// Current value of the clock the kernel stamps datagrams with, in its raw unit.
+std::uint64_t readRawClock() {
+#if defined(__APPLE__)
+    return mach_absolute_time();
+#elif defined(__linux__)
+    timespec r{};
+    ::clock_gettime(CLOCK_REALTIME, &r);
+    return static_cast<std::uint64_t>(r.tv_sec) * 1'000'000'000ull +
+           static_cast<std::uint64_t>(r.tv_nsec);
+#elif defined(_WIN32)
+    LARGE_INTEGER qpc{};
+    QueryPerformanceCounter(&qpc);
+    return static_cast<std::uint64_t>(qpc.QuadPart);
+#else
+    return 0;
+#endif
+}
 
 }  // namespace
 
@@ -72,6 +91,10 @@ bool TimestampedReceiver::enableKernelTimestamps() {
     probeCount_ = 0;
     unstamped_ = 0;
     strikes_ = 0;
+    window_ = {};
+    rateRef_.reset();
+    lastFloor_.reset();
+    ratePpm_ = 0.0;
 
 #if defined(__APPLE__)
     int on = 1;
@@ -152,32 +175,26 @@ std::chrono::nanoseconds TimestampedReceiver::rawToNanos(std::uint64_t raw) cons
 }
 
 void TimestampedReceiver::refreshClockOffset() {
-    // Read both clocks as close together as possible, then take the difference.
-    // Whatever the raw clock's epoch is, this puts converted stamps into the
-    // steady_clock domain.
-    std::uint64_t raw = 0;
-
-#if defined(__APPLE__)
-    raw = mach_absolute_time();
-#elif defined(__linux__)
-    timespec r{};
-    ::clock_gettime(CLOCK_REALTIME, &r);
-    raw = static_cast<std::uint64_t>(r.tv_sec) * 1'000'000'000ull +
-          static_cast<std::uint64_t>(r.tv_nsec);
-#elif defined(_WIN32)
-    LARGE_INTEGER qpc{};
-    QueryPerformanceCounter(&qpc);
-    raw = static_cast<std::uint64_t>(qpc.QuadPart);
-#endif
-
-    const auto steady = Clock::now();
-    clockOffset_ = steady.time_since_epoch() - rawToNanos(raw);
-    offsetSampledAt_ = steady;
+    // Bracket the raw read between two steady_clock reads and pair it with the
+    // midpoint. Whatever the raw clock's epoch is, this puts converted stamps
+    // into the steady_clock domain. A preemption inside the bracket would skew
+    // the offset for the next 2 s, so keep the tightest of a few attempts.
+    auto best = std::chrono::nanoseconds::max();
+    for (int i = 0; i < 3; ++i) {
+        const auto s0  = Clock::now();
+        const auto raw = readRawClock();
+        const auto s1  = Clock::now();
+        if (s1 - s0 < best) {
+            best = s1 - s0;
+            clockOffset_ = (s0.time_since_epoch() + (s1 - s0) / 2) - rawToNanos(raw);
+            offsetSampledAt_ = s1;
+        }
+    }
 }
 
 std::chrono::steady_clock::time_point
-TimestampedReceiver::convert(std::uint64_t raw) {
-    if (Clock::now() - offsetSampledAt_ > std::chrono::seconds{2}) {
+TimestampedReceiver::convert(std::uint64_t raw, Clock::time_point now) {
+    if (now - offsetSampledAt_ > std::chrono::seconds{2}) {
         refreshClockOffset();
     }
     return Clock::time_point{rawToNanos(raw) + clockOffset_};
@@ -238,6 +255,41 @@ void TimestampedReceiver::strike(const char* reason) {
     strikes_ = 0;
 }
 
+void TimestampedReceiver::trackRate(Clock::time_point userStamp, std::uint64_t raw) {
+    // No offset applied: d is trueOffset + latency + rate * t, so the periodic
+    // offset refresh cannot hide a rate error, and the latency floor (the
+    // per-window minimum) is far steadier than a median.
+    const auto d = userStamp.time_since_epoch() - rawToNanos(raw);
+
+    if (window_.min == std::chrono::nanoseconds::max()) window_.at = userStamp;
+    window_.min = std::min(window_.min, d);
+    if (userStamp - window_.at < kRateWindow) return;
+
+    const Floor floor = window_;
+    window_ = {};
+
+    const bool jumped = lastFloor_ &&
+        std::chrono::abs(floor.min - lastFloor_->min) > kRateJump;
+    lastFloor_ = floor;
+    if (!rateRef_ || jumped) {
+        rateRef_ = floor;   // (re)start the baseline
+        return;
+    }
+
+    const auto span = floor.at - rateRef_->at;
+    if (span < kRateBaseline) return;
+
+    ratePpm_ = 1e6 * static_cast<double>((floor.min - rateRef_->min).count()) /
+               static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(span).count());
+    rateRef_ = floor;   // slide the baseline
+
+    if (std::abs(ratePpm_) > kMaxRatePpm) {
+        // A rate error does not go away, so re-probing would only flap.
+        rejectReason_ = "kernel clock runs at a different rate from steady_clock";
+        mode_ = StampMode::Userspace;
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 void TimestampedReceiver::applyStamp(RxResult& out,
@@ -245,6 +297,11 @@ void TimestampedReceiver::applyStamp(RxResult& out,
     const auto userStamp = out.stamp;
 
     if (mode_ == StampMode::Userspace) return;
+
+    if (raw) {
+        trackRate(userStamp, *raw);
+        if (mode_ == StampMode::Userspace) return;
+    }
 
     if (mode_ == StampMode::Probation) {
         if (!raw) {
@@ -257,7 +314,7 @@ void TimestampedReceiver::applyStamp(RxResult& out,
             return;
         }
         // Validate before trusting: keep reporting the userspace stamp.
-        addProbe(userStamp - convert(*raw));
+        addProbe(userStamp - convert(*raw, userStamp));
         return;
     }
 
@@ -267,14 +324,14 @@ void TimestampedReceiver::applyStamp(RxResult& out,
         return;
     }
 
-    auto kernelStamp = convert(*raw);
+    auto kernelStamp = convert(*raw, userStamp);
     auto lag = userStamp - kernelStamp;
 
     if (lag < kMinLag || lag > kMaxLag) {
         // Most likely a clock step (Linux CLOCK_REALTIME) or a macOS wake that
         // moved the offset. Re-measure now instead of up to 2 s later.
         refreshClockOffset();
-        kernelStamp = convert(*raw);
+        kernelStamp = convert(*raw, userStamp);
         lag = userStamp - kernelStamp;
     }
 
@@ -330,11 +387,23 @@ RxResult TimestampedReceiver::receive(std::span<std::uint8_t> buffer,
         ec = asio::error_code(errno, asio::error::get_system_category());
         return out;
     }
+    if (msg.msg_flags & MSG_TRUNC) {
+        // Datagram larger than the buffer: never hand out a partial payload.
+        ec = asio::error::message_size;
+        return out;
+    }
     ec.clear();
     out.bytes = static_cast<std::size_t>(n);
     out.from  = toEndpoint(src);
 
     if (mode_ == StampMode::Userspace) return out;
+    if (msg.msg_flags & MSG_CTRUNC) {
+        // The timestamp may have been cut off. That is a configuration error
+        // (more ancillary options than kControlBytes holds), not a clock problem.
+        rejectReason_ = "control buffer too small for timestamp";
+        mode_ = StampMode::Userspace;
+        return out;
+    }
 
     std::optional<std::uint64_t> raw;
     for (cmsghdr* c = CMSG_FIRSTHDR(&msg); c != nullptr; c = CMSG_NXTHDR(&msg, c)) {
@@ -399,6 +468,7 @@ RxResult TimestampedReceiver::receive(std::span<std::uint8_t> buffer,
     out.stamp = userStamp;
 
     if (rc == SOCKET_ERROR) {
+        // Includes WSAEMSGSIZE: a datagram larger than the buffer never succeeds.
         ec = asio::error_code(::WSAGetLastError(), asio::error::get_system_category());
         return out;
     }
@@ -407,6 +477,11 @@ RxResult TimestampedReceiver::receive(std::span<std::uint8_t> buffer,
     out.from  = toEndpoint(src);
 
     if (mode_ == StampMode::Userspace) return out;
+    if (msg.dwFlags & MSG_CTRUNC) {
+        rejectReason_ = "control buffer too small for timestamp";
+        mode_ = StampMode::Userspace;
+        return out;
+    }
 
     std::optional<std::uint64_t> raw;
     for (WSACMSGHDR* c = WSA_CMSG_FIRSTHDR(&msg); c != nullptr;

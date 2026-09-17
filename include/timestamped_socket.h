@@ -43,8 +43,10 @@ enum class StampMode {
 ///
 ///  * that the kernel timestamp advances at the same rate as steady_clock. A
 ///    NIC providing a hardware timestamp reports its own clock at its own
-///    frequency. A probation phase checks this against live traffic before the
-///    stamps are trusted, and falls back to userspace if they misbehave.
+///    frequency. A probation phase checks the stamps against live traffic
+///    before they are trusted, every stamp is sanity-checked afterwards, and a
+///    long-baseline rate estimate catches clocks that run slightly fast or slow.
+///    Misbehaving stamps fall back to userspace.
 class TimestampedReceiver {
 public:
     explicit TimestampedReceiver(asio::ip::udp::socket& socket);
@@ -69,6 +71,10 @@ public:
     /// re-validation; "" if neither happened since the stamps were last accepted.
     [[nodiscard]] const char* rejectReason() const noexcept { return rejectReason_; }
 
+    /// Latest rate estimate of the kernel stamp clock relative to steady_clock,
+    /// in ppm. 0 until kRateBaseline of stamped traffic has been seen.
+    [[nodiscard]] double kernelRatePpm() const noexcept { return ratePpm_; }
+
     /// One non-blocking read. On success ec is cleared and bytes > 0. Any error
     /// (including would-block, which async_wait can produce) means "no
     /// datagram"; the caller should simply re-arm.
@@ -79,6 +85,14 @@ private:
     static constexpr std::size_t kMaxUnstamped = 64;  ///< probation reads without a stamp before giving up
     static constexpr std::size_t kMaxStrikes   = 8;   ///< consecutive bad stamps before re-validating
 
+    // Rate check: floor of (userspace - raw kernel) per window, compared across
+    // a long baseline. A floor jump larger than kRateJump is a sleep or clock
+    // step, not a rate, and restarts the baseline.
+    static constexpr std::chrono::seconds      kRateWindow{1};
+    static constexpr std::chrono::seconds      kRateBaseline{30};
+    static constexpr std::chrono::milliseconds kRateJump{1};
+    static constexpr double kMaxRatePpm = 10.0;   ///< 20 µs sawtooth at the 2 s offset refresh
+
     /// Raw platform timestamp -> nanoseconds in the raw clock's own domain.
     [[nodiscard]] std::chrono::nanoseconds rawToNanos(std::uint64_t raw) const;
 
@@ -87,7 +101,10 @@ private:
     /// whenever the machine sleeps.
     void refreshClockOffset();
 
-    [[nodiscard]] std::chrono::steady_clock::time_point convert(std::uint64_t raw);
+    /// `now` is the caller's userspace stamp; it only decides whether the
+    /// offset is stale, so saving a clock read per datagram is worth the µs.
+    [[nodiscard]] std::chrono::steady_clock::time_point
+    convert(std::uint64_t raw, std::chrono::steady_clock::time_point now);
 
     /// Mode-dependent handling of one received datagram's stamp. `out.stamp`
     /// holds the userspace stamp on entry and is replaced only if the kernel
@@ -101,6 +118,10 @@ private:
     /// row, drop back to Probation so the stamps are re-validated.
     void strike(const char* reason);
 
+    /// Feed one stamped datagram to the long-baseline rate estimate; rejects
+    /// the kernel stamps if the rate exceeds kMaxRatePpm.
+    void trackRate(std::chrono::steady_clock::time_point userStamp, std::uint64_t raw);
+
     asio::ip::udp::socket& socket_;
     StampMode mode_ = StampMode::Userspace;
     const char* rejectReason_ = "";
@@ -113,6 +134,14 @@ private:
     std::size_t unstamped_ = 0;
     std::size_t strikes_ = 0;
     std::chrono::nanoseconds kernelLag_{0};
+
+    struct Floor {
+        std::chrono::steady_clock::time_point at{};
+        std::chrono::nanoseconds min = std::chrono::nanoseconds::max();
+    };
+    Floor window_{};
+    std::optional<Floor> rateRef_, lastFloor_;
+    double ratePpm_ = 0.0;
 
 #if defined(__APPLE__)
     std::uint64_t machNumer_ = 1, machDenom_ = 1;
