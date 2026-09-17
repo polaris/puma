@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 
 namespace clocksync {
@@ -64,7 +65,8 @@ public:
     /// receive-path latency that kernel timestamping removes.
     [[nodiscard]] std::chrono::nanoseconds kernelLag() const noexcept { return kernelLag_; }
 
-    /// Why probation rejected the stamps, or "" if it did not.
+    /// Why probation rejected the stamps, or why Kernel mode was abandoned for
+    /// re-validation; "" if neither happened since the stamps were last accepted.
     [[nodiscard]] const char* rejectReason() const noexcept { return rejectReason_; }
 
     /// One non-blocking read. On success ec is cleared and bytes > 0. Any error
@@ -73,7 +75,9 @@ public:
     RxResult receive(std::span<std::uint8_t> buffer, asio::error_code& ec);
 
 private:
-    static constexpr std::size_t kProbeCount = 16;
+    static constexpr std::size_t kProbeCount   = 16;
+    static constexpr std::size_t kMaxUnstamped = 64;  ///< probation reads without a stamp before giving up
+    static constexpr std::size_t kMaxStrikes   = 8;   ///< consecutive bad stamps before re-validating
 
     /// Raw platform timestamp -> nanoseconds in the raw clock's own domain.
     [[nodiscard]] std::chrono::nanoseconds rawToNanos(std::uint64_t raw) const;
@@ -85,8 +89,17 @@ private:
 
     [[nodiscard]] std::chrono::steady_clock::time_point convert(std::uint64_t raw);
 
+    /// Mode-dependent handling of one received datagram's stamp. `out.stamp`
+    /// holds the userspace stamp on entry and is replaced only if the kernel
+    /// stamp is trusted and passes the per-packet sanity check.
+    void applyStamp(RxResult& out, std::optional<std::uint64_t> raw);
+
     void addProbe(std::chrono::nanoseconds lag);
     void decideMode();
+
+    /// Count one suspect stamp while in Kernel mode; after kMaxStrikes in a
+    /// row, drop back to Probation so the stamps are re-validated.
+    void strike(const char* reason);
 
     asio::ip::udp::socket& socket_;
     StampMode mode_ = StampMode::Userspace;
@@ -97,6 +110,8 @@ private:
 
     std::array<std::chrono::nanoseconds, kProbeCount> probes_{};
     std::size_t probeCount_ = 0;
+    std::size_t unstamped_ = 0;
+    std::size_t strikes_ = 0;
     std::chrono::nanoseconds kernelLag_{0};
 
 #if defined(__APPLE__)

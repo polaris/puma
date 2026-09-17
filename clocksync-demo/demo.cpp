@@ -32,10 +32,10 @@ int main(int argc, char** argv) {
         if (!i.description.empty()) std::cout << "  (" << i.description << ")";
         std::cout << "\n";
     }
-    const auto chosen = ifName.empty() ? net::find(ifName) : net::selectDefault();
+    const auto chosen = ifName.empty() ? net::selectDefault() : net::find(ifName);
     if (!chosen) {
-        std::cerr << (ifName.empty() ? "no such interface\n"
-                                        : "ambiguous or none; name one explicitly\n");
+        std::cerr << (ifName.empty() ? "ambiguous or none; name one explicitly\n"
+                                     : "no such interface\n");
         return 1;
     }
     std::cout << "using " << chosen->name << " " << chosen->address.to_string() << "\n";

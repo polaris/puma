@@ -102,7 +102,7 @@ private:
     std::atomic<std::uint64_t> statRejected_{0};
     std::atomic<std::uint64_t> statTooSoon_{0};
     std::atomic<bool> statKernelStamps_{false};
-    bool stampModeReported_ = false;   // io thread only
+    std::optional<StampMode> reportedMode_;   // io thread only
     std::atomic<std::uint64_t> userStamps_{0};
 
     Servo servo_;

@@ -117,15 +117,19 @@ void ClockSync::updateMapping(double localRef, double masterRef, double skew) {
 void ClockSync::reportStampMode() {
     // enableKernelTimestamps() only reports that the socket option was
     // accepted. Whether the stamps are usable is decided by probation, which
-    // needs real datagrams, so the answer is only available here.
-    if (stampModeReported_) return;
-    if (receiver_.mode() == StampMode::Probation) return;
-    stampModeReported_ = true;
+    // needs real datagrams, so the answer is only available here. Kernel mode
+    // can later fall back to probation, so every change is reported.
+    const auto mode = receiver_.mode();
+    if (reportedMode_ == mode) return;
+    if (!reportedMode_ && mode == StampMode::Probation) return;
+    reportedMode_ = mode;
 
     const auto lagUs = std::chrono::duration_cast<std::chrono::microseconds>(
                            receiver_.kernelLag()).count();
     std::cerr << "timestamps: "
-              << (receiver_.kernelTimestamps() ? "kernel" : "userspace")
+              << (mode == StampMode::Kernel      ? "kernel"
+                : mode == StampMode::Probation ? "probation"
+                                               : "userspace")
               << "  lag=" << lagUs << " us";
     if (const char* why = receiver_.rejectReason(); why && *why) {
         std::cerr << "  (" << why << ")";

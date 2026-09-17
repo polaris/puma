@@ -70,6 +70,8 @@ bool TimestampedReceiver::enableKernelTimestamps() {
     mode_ = StampMode::Userspace;
     rejectReason_ = "";
     probeCount_ = 0;
+    unstamped_ = 0;
+    strikes_ = 0;
 
 #if defined(__APPLE__)
     int on = 1;
@@ -221,7 +223,78 @@ void TimestampedReceiver::decideMode() {
         return;
     }
 
+    rejectReason_ = "";
     mode_ = StampMode::Kernel;
+}
+
+void TimestampedReceiver::strike(const char* reason) {
+    if (++strikes_ < kMaxStrikes) return;
+    // Back to probation rather than straight to userspace: a transient problem
+    // recovers, a genuinely broken clock domain is rejected by decideMode().
+    rejectReason_ = reason;
+    mode_ = StampMode::Probation;
+    probeCount_ = 0;
+    unstamped_ = 0;
+    strikes_ = 0;
+}
+
+// ---------------------------------------------------------------------------
+
+void TimestampedReceiver::applyStamp(RxResult& out,
+                                     std::optional<std::uint64_t> raw) {
+    const auto userStamp = out.stamp;
+
+    if (mode_ == StampMode::Userspace) return;
+
+    if (mode_ == StampMode::Probation) {
+        if (!raw) {
+            // The option was accepted but stamps never arrive (seen with some
+            // Windows NIC drivers). Don't sit in probation forever.
+            if (++unstamped_ >= kMaxUnstamped) {
+                rejectReason_ = "option accepted but no kernel timestamps delivered";
+                mode_ = StampMode::Userspace;
+            }
+            return;
+        }
+        // Validate before trusting: keep reporting the userspace stamp.
+        addProbe(userStamp - convert(*raw));
+        return;
+    }
+
+    // Kernel mode: every stamp is checked against the userspace stamp.
+    if (!raw) {
+        strike("kernel timestamps stopped arriving");
+        return;
+    }
+
+    auto kernelStamp = convert(*raw);
+    auto lag = userStamp - kernelStamp;
+
+    if (lag < kMinLag || lag > kMaxLag) {
+        // Most likely a clock step (Linux CLOCK_REALTIME) or a macOS wake that
+        // moved the offset. Re-measure now instead of up to 2 s later.
+        refreshClockOffset();
+        kernelStamp = convert(*raw);
+        lag = userStamp - kernelStamp;
+    }
+
+    if (lag < kMinLag) {
+        // Stamped after we read the packet: impossible, so the stamp is wrong.
+        // Never report it; out.stamp stays the userspace stamp.
+        strike("kernel stamp is ahead of the userspace stamp");
+        return;
+    }
+
+    if (lag > kMaxLag) {
+        // Ambiguous: a real stall of this thread looks the same, and then the
+        // kernel stamp is exactly the right one. Use it, but count it.
+        strike("kernel stamp persistently lags implausibly far behind");
+    } else {
+        strikes_ = 0;
+    }
+
+    out.stamp = kernelStamp;
+    out.kernelStamp = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -263,16 +336,15 @@ RxResult TimestampedReceiver::receive(std::span<std::uint8_t> buffer,
 
     if (mode_ == StampMode::Userspace) return out;
 
+    std::optional<std::uint64_t> raw;
     for (cmsghdr* c = CMSG_FIRSTHDR(&msg); c != nullptr; c = CMSG_NXTHDR(&msg, c)) {
         if (c->cmsg_level != SOL_SOCKET) continue;
-
-        std::uint64_t raw = 0;
-        bool found = false;
-
 #if defined(__APPLE__)
         if (c->cmsg_type == SCM_TIMESTAMP_MONOTONIC) {
-            std::memcpy(&raw, CMSG_DATA(c), sizeof(raw));
-            found = true;
+            std::uint64_t v = 0;
+            std::memcpy(&v, CMSG_DATA(c), sizeof(v));
+            raw = v;
+            break;
         }
 #elif defined(__linux__)
         if (c->cmsg_type == SCM_TIMESTAMPNS) {
@@ -280,21 +352,11 @@ RxResult TimestampedReceiver::receive(std::span<std::uint8_t> buffer,
             std::memcpy(&ts, CMSG_DATA(c), sizeof(ts));
             raw = static_cast<std::uint64_t>(ts.tv_sec) * 1'000'000'000ull +
                   static_cast<std::uint64_t>(ts.tv_nsec);
-            found = true;
+            break;
         }
 #endif
-        if (!found) continue;
-
-        const auto kernelStamp = convert(raw);
-        if (mode_ == StampMode::Probation) {
-            // Validate before trusting: keep reporting the userspace stamp.
-            addProbe(userStamp - kernelStamp);
-        } else {
-            out.stamp = kernelStamp;
-            out.kernelStamp = true;
-        }
-        break;
     }
+    applyStamp(out, raw);
     return out;
 }
 
@@ -346,21 +408,17 @@ RxResult TimestampedReceiver::receive(std::span<std::uint8_t> buffer,
 
     if (mode_ == StampMode::Userspace) return out;
 
+    std::optional<std::uint64_t> raw;
     for (WSACMSGHDR* c = WSA_CMSG_FIRSTHDR(&msg); c != nullptr;
          c = WSA_CMSG_NXTHDR(&msg, c)) {
         if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SO_TIMESTAMP) {
-            UINT64 raw = 0;
-            std::memcpy(&raw, WSA_CMSG_DATA(c), sizeof(raw));
-            const auto kernelStamp = convert(raw);
-            if (mode_ == StampMode::Probation) {
-                addProbe(userStamp - kernelStamp);
-            } else {
-                out.stamp = kernelStamp;
-                out.kernelStamp = true;
-            }
+            UINT64 v = 0;
+            std::memcpy(&v, WSA_CMSG_DATA(c), sizeof(v));
+            raw = v;
             break;
         }
     }
+    applyStamp(out, raw);
     return out;
 }
 
