@@ -6,3 +6,6 @@ cmake --preset conan-release -DPUMA_NATIVE_ARCH=ON
 
 # 3. Build
 cmake --build --preset conan-release
+
+# 4. Run the tests
+ctest --preset conan-release --output-on-failure
