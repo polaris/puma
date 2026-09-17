@@ -36,7 +36,6 @@ struct SenderContext {
 
 void data_callback(ma_device* device, void* output, const void* input, ma_uint32 frameCount) {
     (void)output;
-    const auto now = Clock::now();
     auto* ctx = static_cast<SenderContext*>(device->pUserData);
  
     const std::size_t payload = kHeaderBytes + frameCount * ctx->bytesPerFrame;

@@ -86,11 +86,11 @@ int main(int argc, char** argv) {
                 std::uint64_t ts;
                 std::memcpy(&ts, buf.data() + 8, 8);
 
-                const std::array<std::uint8_t, 8192> payload = [&] {
-                    std::array<std::uint8_t, 8192> out{};
-                    std::memcpy(out.data(), buf.data() + 16, n - 16);
-                    return out;
-                }();
+                // const std::array<std::uint8_t, 8192> payload = [&] {
+                //     std::array<std::uint8_t, 8192> out{};
+                //     std::memcpy(out.data(), buf.data() + 16, n - 16);
+                //     return out;
+                // }();
 
                 arm();
 
