@@ -9,6 +9,39 @@ if(WIN32)
     add_compile_definitions(_WIN32_WINNT=0x0A00 NTDDI_VERSION=0x0A00000A)
 endif()
 
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+option(PUMA_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
+option(PUMA_NATIVE_ARCH "Optimize release builds for the host CPU (binaries are not portable)" OFF)
+
+if(MSVC)
+    add_compile_options(/W4 /permissive- $<$<BOOL:${PUMA_WARNINGS_AS_ERRORS}>:/WX>)
+else()
+    add_compile_options(
+        -Wall -Wextra -Wpedantic -Wshadow -Wnon-virtual-dtor -Wold-style-cast
+        -Wcast-align -Woverloaded-virtual -Wnull-dereference -Wdouble-promotion
+        -Wimplicit-fallthrough
+        $<$<BOOL:${PUMA_WARNINGS_AS_ERRORS}>:-Werror>)
+endif()
+
+if(MSVC)
+    add_compile_options($<$<CONFIG:Release>:/Oi> $<$<CONFIG:Release>:/Gy>)
+    add_link_options($<$<CONFIG:Release>:/OPT:REF> $<$<CONFIG:Release>:/OPT:ICF>)
+elseif(PUMA_NATIVE_ARCH)
+    add_compile_options($<$<CONFIG:Release>:-march=native>)
+endif()
+
+# Link-time optimization for release builds when the toolchain supports it.
+include(CheckIPOSupported)
+check_ipo_supported(RESULT PUMA_IPO_SUPPORTED OUTPUT PUMA_IPO_OUTPUT LANGUAGES CXX)
+if(PUMA_IPO_SUPPORTED)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+else()
+    message(STATUS "IPO/LTO not supported: ${PUMA_IPO_OUTPUT}")
+endif()
+
 find_package(asio REQUIRED)
 find_package(miniaudio REQUIRED)
 find_package(CLI11 REQUIRED)
