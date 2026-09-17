@@ -94,6 +94,7 @@ bool TimestampedReceiver::enableKernelTimestamps() {
     window_ = {};
     rateRef_.reset();
     lastFloor_.reset();
+    lastEstimate_.reset();
     ratePpm_ = 0.0;
 
 #if defined(__APPLE__)
@@ -197,7 +198,29 @@ TimestampedReceiver::convert(std::uint64_t raw, Clock::time_point now) {
     if (now - offsetSampledAt_ > std::chrono::seconds{2}) {
         refreshClockOffset();
     }
-    return Clock::time_point{rawToNanos(raw) + clockOffset_};
+
+    // The raw clock may run at a slightly different rate from steady_clock, so
+    // the offset measured at offsetSampledAt_ goes stale linearly: without this
+    // term the error is a sawtooth that grows to rate x refreshInterval and
+    // snaps back at every refresh. Extrapolating leaves only the error in the
+    // agreed rate, which is bounded by kRateAgreePpm plus the floor noise over
+    // a 30 s baseline, provided the floor stays level. trackRate() only
+    // publishes a rate that two consecutive baselines agree on, so a one-off
+    // floor shift is not extrapolated.
+    //
+    // Sign: trackRate() measures d = userspace - rawToNanos(raw), so a raw clock
+    // that runs slow makes d grow and ratePpm_ positive, and the uncorrected
+    // conversion lands too early. Hence +.
+    //
+    // ratePpm_ is 0 until two baselines agree, so the first ~60 s of a run is
+    // uncorrected. That is deliberate: the servo is still acquiring then, and
+    // its mapping is not trustworthy yet for other reasons anyway.
+    const auto age = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         now - offsetSampledAt_).count();
+    const auto drift = std::chrono::nanoseconds{
+        static_cast<std::int64_t>(ratePpm_ * 1e-6 * static_cast<double>(age))};
+
+    return Clock::time_point{rawToNanos(raw) + clockOffset_ + drift};
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +282,10 @@ void TimestampedReceiver::trackRate(Clock::time_point userStamp, std::uint64_t r
     // No offset applied: d is trueOffset + latency + rate * t, so the periodic
     // offset refresh cannot hide a rate error, and the latency floor (the
     // per-window minimum) is far steadier than a median.
+    //
+    // Must stay rawToNanos() and not convert(): convert() now subtracts the
+    // measured rate, so routing this through it would feed the correction back
+    // into its own input and drive ratePpm_ to zero regardless of the truth.
     const auto d = userStamp.time_since_epoch() - rawToNanos(raw);
 
     if (window_.min == std::chrono::nanoseconds::max()) window_.at = userStamp;
@@ -279,15 +306,30 @@ void TimestampedReceiver::trackRate(Clock::time_point userStamp, std::uint64_t r
     const auto span = floor.at - rateRef_->at;
     if (span < kRateBaseline) return;
 
-    ratePpm_ = 1e6 * static_cast<double>((floor.min - rateRef_->min).count()) /
-               static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(span).count());
+    const double estimate =
+        1e6 * static_cast<double>((floor.min - rateRef_->min).count()) /
+        static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(span).count());
     rateRef_ = floor;   // slide the baseline
 
-    if (std::abs(ratePpm_) > kMaxRatePpm) {
-        // A rate error does not go away, so re-probing would only flap.
+    const auto previous = lastEstimate_;
+    lastEstimate_ = estimate;
+    if (!previous || std::abs(estimate - *previous) > kRateAgreePpm) {
+        // Unconfirmed: either the first estimate, or a floor shift below
+        // kRateJump distorted one of the two baselines. Keep the last agreed
+        // rate; a real rate is stable and will agree next time.
+        return;
+    }
+    const double agreed = (estimate + *previous) / 2;
+
+    if (std::abs(agreed) > kMaxRatePpm) {
+        // A rate error does not go away, so re-probing would only flap. Note
+        // this is a sanity bound rather than an accuracy one: rates within it
+        // are corrected for in convert().
         rejectReason_ = "kernel clock runs at a different rate from steady_clock";
         mode_ = StampMode::Userspace;
+        return;
     }
+    ratePpm_ = agreed;
 }
 
 // ---------------------------------------------------------------------------

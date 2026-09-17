@@ -71,8 +71,9 @@ public:
     /// re-validation; "" if neither happened since the stamps were last accepted.
     [[nodiscard]] const char* rejectReason() const noexcept { return rejectReason_; }
 
-    /// Latest rate estimate of the kernel stamp clock relative to steady_clock,
-    /// in ppm. 0 until kRateBaseline of stamped traffic has been seen.
+    /// Rate of the kernel stamp clock relative to steady_clock, in ppm, as
+    /// currently corrected for in convert(). 0 until two consecutive
+    /// kRateBaseline estimates have agreed within kRateAgreePpm.
     [[nodiscard]] double kernelRatePpm() const noexcept { return ratePpm_; }
 
     /// One non-blocking read. On success ec is cleared and bytes > 0. Any error
@@ -86,12 +87,27 @@ private:
     static constexpr std::size_t kMaxStrikes   = 8;   ///< consecutive bad stamps before re-validating
 
     // Rate check: floor of (userspace - raw kernel) per window, compared across
-    // a long baseline. A floor jump larger than kRateJump is a sleep or clock
-    // step, not a rate, and restarts the baseline.
+    // a long baseline.
     static constexpr std::chrono::seconds      kRateWindow{1};
     static constexpr std::chrono::seconds      kRateBaseline{30};
-    static constexpr std::chrono::milliseconds kRateJump{1};
-    static constexpr double kMaxRatePpm = 10.0;   ///< 20 µs sawtooth at the 2 s offset refresh
+    // Sanity bound only: convert() extrapolates an agreed rate away, so what is
+    // left to catch here is a clock that is not merely off-frequency but wrong,
+    // well outside crystal tolerance.
+    static constexpr double kMaxRatePpm = 100.0;
+    // A clock within kMaxRatePpm moves the floor by at most 100 µs per window.
+    // Anything larger is a step (sleep, clock step, or a shift in the latency
+    // floor itself, e.g. CPU idle states or Wi-Fi power save), not a rate, and
+    // restarts the baseline instead of being read as a slope.
+    static constexpr std::chrono::microseconds kRateJump{150};
+    static_assert(kMaxRatePpm * 1e-6 *
+                      static_cast<double>(std::chrono::microseconds{kRateWindow}.count()) <
+                  static_cast<double>(kRateJump.count()),
+                  "kRateJump must exceed the floor movement a kMaxRatePpm clock can cause");
+    // A floor shift below kRateJump still lands in one baseline as a false
+    // slope, but not in the next. Estimates are acted on only when two
+    // consecutive ones agree, which a real (stable) rate does and a one-off
+    // shift does not.
+    static constexpr double kRateAgreePpm = 1.0;
 
     /// Raw platform timestamp -> nanoseconds in the raw clock's own domain.
     [[nodiscard]] std::chrono::nanoseconds rawToNanos(std::uint64_t raw) const;
@@ -141,7 +157,8 @@ private:
     };
     Floor window_{};
     std::optional<Floor> rateRef_, lastFloor_;
-    double ratePpm_ = 0.0;
+    std::optional<double> lastEstimate_;   ///< previous baseline's estimate, ppm
+    double ratePpm_ = 0.0;                 ///< agreed rate, applied in convert()
 
 #if defined(__APPLE__)
     std::uint64_t machNumer_ = 1, machDenom_ = 1;

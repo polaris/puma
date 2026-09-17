@@ -50,7 +50,9 @@ void ClockSync::start() {
     sequence_ = 0;
     servo_.configure(config_.acquireBandwidth, config_.lockBandwidth);
     socket_.non_blocking(true);
-    const bool k = receiver_.enableKernelTimestamps();
+    // Only reports that the socket option was accepted. Whether the stamps are
+    // usable is decided by probation, and reported by reportStampMode().
+    (void)receiver_.enableKernelTimestamps();
     armReceive();
     if (role_ == Role::Master) {
         armSyncTimer();
@@ -130,7 +132,8 @@ void ClockSync::reportStampMode() {
               << (mode == StampMode::Kernel      ? "kernel"
                 : mode == StampMode::Probation ? "probation"
                                                : "userspace")
-              << "  lag=" << lagUs << " us";
+              << "  lag=" << lagUs << " us"
+              << "  rate=" << receiver_.kernelRatePpm() << " ppm";
     if (const char* why = receiver_.rejectReason(); why && *why) {
         std::cerr << "  (" << why << ")";
     }
