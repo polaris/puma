@@ -1,5 +1,6 @@
 #include "clock_sync.h"
 #include "netint.h"
+#include "spsc_ring.h"
 
 #include <chrono>
 #include <cstdint>
@@ -10,22 +11,20 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <CLI/CLI.hpp>
 #include <asio.hpp>
 
 namespace {
+
+SpscRing<clocksync::Sample, 64> ring;
 
 // The per-sample log goes to stdout, the human status line to stderr, so that
 // `clocksync-demo -r slave > run.log` keeps the log machine-readable and still
 // shows progress on the terminal. Two streams also means the io thread and the
 // main thread are not writing to one stream object.
 void logSample(const clocksync::Sample& s) {
-    std::cout << s.offset * 1e6 << " "        // theta_raw, us
-              << s.delay * 1e6 << " "         // delay, us
-              << s.mappedOffset * 1e6 << " "  // theta from mapping, us
-              << s.skew * 1e6 << " "          // ppm
-              << s.rejected << " "            // increments on reject
-              << s.tooSoon << "\n";
+    ring.push(s);
 }
 
 // state() and quality are deliberately absent: ClockSync::state() is still a
@@ -57,7 +56,7 @@ void printStatus(const clocksync::Stats& s) {
 
 }  // namespace
 
-constexpr std::string kDefaultMulitcastGroup = "239.255.0.2";
+constexpr std::string_view kDefaultMulticastGroup = "239.255.0.2";
 constexpr int kDefaultPort = 12346;
 constexpr clocksync::Role kDefaultRole = clocksync::Role::Master;
 constexpr int kDefaultSyncInterval = 125;
@@ -68,6 +67,7 @@ constexpr double kDefaultAcquireBandwidth = 0.5;
 constexpr double kDefaultLockBandwidth = 0.05;
 
 constexpr auto kStatusInterval = std::chrono::seconds{5};
+constexpr auto kSampleLogInterval = std::chrono::milliseconds{100};
 
 int main(int argc, char** argv) {
     std::cout << std::fixed << std::showpoint;
@@ -78,7 +78,7 @@ int main(int argc, char** argv) {
     argv = app.ensure_utf8(argv);  // proper Unicode handling on Windows
 
     std::string ifName;
-    std::string group = kDefaultMulitcastGroup;
+    std::string group{kDefaultMulticastGroup};
     int port = kDefaultPort;
     int domain = kDefaultDomain;
     std::uint64_t nodeId = kDefaultNodeId;
@@ -98,15 +98,15 @@ int main(int argc, char** argv) {
         ->required()
         ->transform(CLI::CheckedTransformer(roles, CLI::ignore_case));
     app.add_option("-d,--domain", domain, "Domain")
-        ->check(CLI::NonNegativeNumber)
+        ->check(CLI::Range(0, 255))
         ->default_val(kDefaultDomain);
     app.add_option("-g,--group", group, "Multicast group")
         ->check(CLI::ValidIPV4)
-        ->default_str(kDefaultMulitcastGroup);
+        ->default_str(std::string{kDefaultMulticastGroup});
     app.add_option("-p,--port", port, "Multicast port")
-        ->check(CLI::PositiveNumber)
+        ->check(CLI::Range(1, 65535))
         ->default_val(kDefaultPort);
-    app.add_flag("-l,--loopback", loopback, "Loopback")
+    app.add_option("-l,--loopback", loopback, "Loopback")
         ->default_val(true);
     app.add_option("--syncInterval", syncInterval, "Sync interval")
         ->check(CLI::Range(50, 500))
@@ -146,8 +146,12 @@ int main(int argc, char** argv) {
             .group = asio::ip::udp::endpoint(asio::ip::make_address(group), port),
             .iface = *chosen,
             .nodeId = nodeId,
+            .domain = static_cast<std::uint8_t>(domain),
             .syncInterval = std::chrono::milliseconds{syncInterval},
             .delayReqInterval = std::chrono::milliseconds{delayReqInterval},
+            .acquireBandwidth = acquireBandwidth,
+            .lockBandwidth = lockBandwidth,
+            .loopback = loopback
         };
         clocksync::ClockSync cs{config, role};
         cs.onSample(logSample);   // before start(): read from the io thread
@@ -159,6 +163,23 @@ int main(int argc, char** argv) {
             std::cerr << "\nshutting down\n";
             wait.stop();
         });
+
+        asio::steady_timer sampleLog{wait, kSampleLogInterval};
+        std::function<void(const asio::error_code&)> tack = [&](const asio::error_code& ec) {
+            if (ec) return;
+            clocksync::Sample s{};
+            while (ring.pop(s)) {
+                std::cout << s.offset * 1e6 << " "        // theta_raw, us
+                                            << s.delay * 1e6 << " "         // delay, us
+                                            << s.mappedOffset * 1e6 << " "  // theta from mapping, us
+                                            << s.skew * 1e6 << " "          // ppm
+                                            << s.rejected << " "            // increments on reject
+                                            << s.tooSoon << "\n";
+            }
+            sampleLog.expires_at(sampleLog.expiry() + kSampleLogInterval);
+            sampleLog.async_wait(tack);
+        };
+        sampleLog.async_wait(tack);
 
         asio::steady_timer status{wait, kStatusInterval};
         std::function<void(const asio::error_code&)> tick = [&](const asio::error_code& ec) {
