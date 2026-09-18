@@ -28,6 +28,12 @@ public:
     [[nodiscard]] State state() const;
     [[nodiscard]] std::chrono::nanoseconds pathDelay() const;
     [[nodiscard]] std::chrono::nanoseconds gateThreshold() const;
+
+    // A threshold exists from the first sample on, but it is only applied once
+    // the window holds kMinForGate entries. Callers reporting the gate should
+    // ask this rather than testing gateThreshold() against nanoseconds::max(),
+    // which only says that no sample has arrived since the last reset().
+    [[nodiscard]] bool gateActive() const;
     [[nodiscard]] std::uint64_t rejected() const;
     [[nodiscard]] std::uint64_t tooSoon() const;
 

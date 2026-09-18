@@ -19,9 +19,10 @@ enum class Role { Master, Slave };
 struct Stats {
     double offset        = 0.0;   // master - local, seconds
     double pathDelay     = 0.0;   // rolling minimum one-way delay, seconds
-    // Empty until the servo has collected enough delay samples to form a gate;
-    // Servo reports that state as nanoseconds::max(), which is not a duration
-    // worth handing to a caller.
+    // Empty until the servo's delay window holds enough samples for the gate to
+    // be applied. A threshold is computed from the first sample on, but until
+    // the window fills nothing is rejected by it, so reporting it would read as
+    // a live rejection threshold that is not in force.
     std::optional<double> gateThreshold;  // current outlier gate, seconds
     double quality       = 0.0;   // 0..1, 1 is best
 

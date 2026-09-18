@@ -48,7 +48,7 @@ void Servo::addSample(double localSeconds, double masterSeconds,
     }
 
     // 3. now the gate is meaningful
-    if (delayCount_ >= kMinForGate && delay > gateThreshold_) { ++rejected_; return; }
+    if (gateActive() && delay > gateThreshold_) { ++rejected_; return; }
 
     const double T = localSeconds - current_->localRef;
     if (T < 0.01) {
@@ -109,6 +109,7 @@ void Servo::updateDelayWindow(std::chrono::nanoseconds delay) {
 
 std::chrono::nanoseconds Servo::pathDelay() const { return pathDelay_; }
 std::chrono::nanoseconds Servo::gateThreshold() const { return gateThreshold_; }
+bool Servo::gateActive() const { return delayCount_ >= kMinForGate; }
 std::uint64_t Servo::rejected() const { return rejected_; }
 std::uint64_t Servo::tooSoon() const { return tooSoon_; }
 

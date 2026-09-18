@@ -146,9 +146,9 @@ void ClockSync::reportStampMode() {
 
 void ClockSync::publishStats() {
     statPathDelay_.store(toSeconds(servo_.pathDelay()), std::memory_order_relaxed);
-    const auto gate = servo_.gateThreshold();
-    const bool gateSeeded = gate != std::chrono::nanoseconds::max();
-    statGate_.store(gateSeeded ? toSeconds(gate) : 0.0, std::memory_order_relaxed);
+    const bool gateSeeded = servo_.gateActive();
+    statGate_.store(gateSeeded ? toSeconds(servo_.gateThreshold()) : 0.0,
+                    std::memory_order_relaxed);
     statGateSeeded_.store(gateSeeded, std::memory_order_relaxed);
     statKernelLag_.store(toSeconds(receiver_.kernelLag()), std::memory_order_relaxed);
     statRejected_.store(servo_.rejected(), std::memory_order_relaxed);

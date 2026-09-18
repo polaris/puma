@@ -105,6 +105,28 @@ TEST_CASE("the servo locks and converges on the injected skew", "[servo]") {
     }
 }
 
+TEST_CASE("the gate is computed before it is in force", "[servo]") {
+    Servo servo;
+    servo.configure(0.5, 0.05);
+
+    // kMinForGate is 16. One sample is enough to produce a threshold, so the
+    // sentinel is gone long before anything is actually gated by it.
+    double local = 0.0;
+    servo.addSample(local, masterAt(local), 1ms);
+    local += kInterval;
+    REQUIRE(servo.gateThreshold() != std::chrono::nanoseconds::max());
+    REQUIRE_FALSE(servo.gateActive());
+
+    for (int i = 1; i < 15; ++i) {
+        servo.addSample(local, masterAt(local), 1ms);
+        local += kInterval;
+    }
+    REQUIRE_FALSE(servo.gateActive());
+
+    servo.addSample(local, masterAt(local), 1ms);
+    REQUIRE(servo.gateActive());
+}
+
 TEST_CASE("the delay gate rejects outliers once the window is large enough", "[servo]") {
     Servo servo;
     servo.configure(0.5, 0.05);
