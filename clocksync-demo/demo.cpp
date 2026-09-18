@@ -3,6 +3,7 @@
 
 #include <iostream>
 #include <CLI/CLI.hpp>
+#include <asio.hpp>
 
 int main(int argc, char** argv) {
     std::cout << std::fixed << std::showpoint;
@@ -48,5 +49,10 @@ int main(int argc, char** argv) {
     clocksync::ClockSync cs{config, role};
     cs.start();
 
-    getchar();
+    asio::io_context wait;
+    asio::signal_set signals{wait, SIGINT, SIGTERM};
+    signals.async_wait([&](auto, int) { wait.stop(); });
+    wait.run();
+
+    cs.stop();
 }
