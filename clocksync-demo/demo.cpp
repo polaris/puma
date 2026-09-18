@@ -2,6 +2,7 @@
 #include "netint.h"
 #include "spsc_ring.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <exception>
@@ -19,12 +20,30 @@ namespace {
 
 SpscRing<clocksync::Sample, 64> ring;
 
+// Written by the io thread when the ring is full, read by the main thread for
+// the status line. Without it a starved drain would thin out the log with no
+// trace of it in the file the analysis reads.
+std::atomic<std::uint64_t> dropped{0};
+
+// Runs on the io thread, so it only hands the sample over; the formatting and
+// the write happen on the main thread in drainSamples().
+void logSample(const clocksync::Sample& s) {
+    if (!ring.push(s)) dropped.fetch_add(1, std::memory_order_relaxed);
+}
+
 // The per-sample log goes to stdout, the human status line to stderr, so that
 // `clocksync-demo -r slave > run.log` keeps the log machine-readable and still
-// shows progress on the terminal. Two streams also means the io thread and the
-// main thread are not writing to one stream object.
-void logSample(const clocksync::Sample& s) {
-    ring.push(s);
+// shows progress on the terminal.
+void drainSamples() {
+    clocksync::Sample s{};
+    while (ring.pop(s)) {
+        std::cout << s.offset * 1e6 << " "        // theta_raw, us
+                  << s.delay * 1e6 << " "         // delay, us
+                  << s.mappedOffset * 1e6 << " "  // theta from mapping, us
+                  << s.skew * 1e6 << " "          // ppm
+                  << s.rejected << " "            // increments on reject
+                  << s.tooSoon << "\n";
+    }
 }
 
 // state() and quality are deliberately absent: ClockSync::state() is still a
@@ -51,6 +70,7 @@ void printStatus(const clocksync::Stats& s) {
               << "  unmatched=" << s.unmatched
               << "  noSync=" << s.noSync
               << "  staleSync=" << s.staleSync
+              << "  dropped=" << dropped.load(std::memory_order_relaxed)
               << "\n";
 }
 
@@ -167,15 +187,7 @@ int main(int argc, char** argv) {
         asio::steady_timer sampleLog{wait, kSampleLogInterval};
         std::function<void(const asio::error_code&)> tack = [&](const asio::error_code& ec) {
             if (ec) return;
-            clocksync::Sample s{};
-            while (ring.pop(s)) {
-                std::cout << s.offset * 1e6 << " "        // theta_raw, us
-                                            << s.delay * 1e6 << " "         // delay, us
-                                            << s.mappedOffset * 1e6 << " "  // theta from mapping, us
-                                            << s.skew * 1e6 << " "          // ppm
-                                            << s.rejected << " "            // increments on reject
-                                            << s.tooSoon << "\n";
-            }
+            drainSamples();
             sampleLog.expires_at(sampleLog.expiry() + kSampleLogInterval);
             sampleLog.async_wait(tack);
         };
@@ -191,6 +203,15 @@ int main(int argc, char** argv) {
         status.async_wait(tick);
 
         wait.run();
+
+        // run() returns on the signal with up to a full ring still unwritten.
+        // stop() first, so the io thread is joined and done pushing, then take
+        // the tail; without this every Ctrl-C loses the last samples.
+        cs.stop();
+        drainSamples();
+        if (const auto lost = dropped.load(std::memory_order_relaxed); lost > 0) {
+            std::cerr << "dropped " << lost << " samples\n";
+        }
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
         return 1;
