@@ -17,7 +17,9 @@ option(PUMA_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(PUMA_NATIVE_ARCH "Optimize release builds for the host CPU (binaries are not portable)" OFF)
 
 if(MSVC)
-    add_compile_options(/W4 /permissive- $<$<BOOL:${PUMA_WARNINGS_AS_ERRORS}>:/WX>)
+    # C4324: structure padded due to alignment specifier. That padding is the point
+    # of the alignas() cache-line separation in spsc_ring.h and packet_ring.h.
+    add_compile_options(/W4 /permissive- /wd4324 $<$<BOOL:${PUMA_WARNINGS_AS_ERRORS}>:/WX>)
 else()
     add_compile_options(
         -Wall -Wextra -Wpedantic -Wshadow -Wnon-virtual-dtor -Wold-style-cast

@@ -7,7 +7,7 @@ add_executable(puma_tests
     test_time_filter.cpp
 )
 
-# The Conan toolchain pins CMAKE_CXX_STANDARD to 17; the code under test needs 20.
+# The Conan toolchain pins CMAKE_CXX_STANDARD to 14; the code under test needs 20.
 target_compile_features(puma_tests PRIVATE cxx_std_20)
 target_include_directories(puma_tests PRIVATE ${PROJECT_SOURCE_DIR}/include)
 

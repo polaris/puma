@@ -4,6 +4,7 @@
 #include <atomic>
 #include <array>
 #include <cassert>
+#include <new>  // std::hardware_destructive_interference_size
 
 template <typename T, std::size_t Capacity>
 class SpscRing {
