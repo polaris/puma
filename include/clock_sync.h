@@ -9,6 +9,7 @@
 
 #include <asio.hpp>
 #include <chrono>
+#include <functional>
 #include <optional>
 
 namespace clocksync {
@@ -18,7 +19,10 @@ enum class Role { Master, Slave };
 struct Stats {
     double offset        = 0.0;   // master - local, seconds
     double pathDelay     = 0.0;   // rolling minimum one-way delay, seconds
-    double gateThreshold = 0.0;   // current outlier gate, seconds
+    // Empty until the servo has collected enough delay samples to form a gate;
+    // Servo reports that state as nanoseconds::max(), which is not a duration
+    // worth handing to a caller.
+    std::optional<double> gateThreshold;  // current outlier gate, seconds
     double quality       = 0.0;   // 0..1, 1 is best
 
     // Which receive timestamps the servo is actually being fed. A pair of nodes
@@ -34,13 +38,27 @@ struct Stats {
     std::uint64_t staleSync = 0;  // paired Sync too old to use
 };
 
+// One completed DelayReq/DelayResp exchange, before the servo smooths it.
+// Handed to the sample callback on the io thread, so the callback must not
+// block. The smoothed, thread-safe view of the same clock is Stats.
+struct Sample {
+    double offset;        // (t2-t1 - (t4-t3))/2, seconds, this exchange alone
+    double delay;         // one-way delay for this exchange, seconds
+    double mappedOffset;  // the servo's estimate of offset; sign follows the
+                          // field above, so it is -Stats::offset
+    double skew;          // master seconds per local second, minus 1
+
+    std::uint64_t rejected;  // servo counters at the time of this sample
+    std::uint64_t tooSoon;
+};
+
 struct Config {
     asio::ip::udp::endpoint group;        // 239.255.0.2:12346 — not the audio group
     net::Interface iface;
     std::uint8_t domain = 0;              // two systems, one LAN, no interference
-    std::uint64_t nodeId = 0;             // 0 = generate; used to ignore our own packets
+    std::uint64_t nodeId = 0;             // used to ignore our own packets
     std::chrono::milliseconds syncInterval{125};        // 8/s
-    std::chrono::milliseconds delayReqInterval{125};    // randomized per node
+    std::chrono::milliseconds delayReqInterval{125};    // 8/s
     double acquireBandwidth = 0.5;        // Hz
     double lockBandwidth    = 0.05;       // Hz
     bool loopback = true;                 // single-machine testing
@@ -64,6 +82,10 @@ public:
     ~ClockSync();                                  // stops and joins the worker
     void start();                                  // spawns its own thread
     void stop();
+
+    // Per-sample log hook, in place of the library writing to stdout. Set it
+    // before start(); it is then read from the io thread without a lock.
+    void onSample(std::function<void(const Sample&)> callback);
 
     [[nodiscard]] std::optional<ClockMapping> mapping() const noexcept;  // audio-thread safe
     [[nodiscard]] State state() const noexcept;      // Unsynced / Acquiring / Locked / Holdover
@@ -98,6 +120,7 @@ private:
     // and TimestampedReceiver members directly.
     std::atomic<double> statPathDelay_{0.0};
     std::atomic<double> statGate_{0.0};
+    std::atomic<bool> statGateSeeded_{false};
     std::atomic<double> statKernelLag_{0.0};
     std::atomic<std::uint64_t> statRejected_{0};
     std::atomic<std::uint64_t> statTooSoon_{0};
@@ -106,6 +129,7 @@ private:
     std::atomic<std::uint64_t> userStamps_{0};
 
     Servo servo_;
+    std::function<void(const Sample&)> onSample_;
 
     void sendMessage(const SyncMessage& msg);
 

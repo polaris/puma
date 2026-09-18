@@ -70,6 +70,10 @@ ClockSync::~ClockSync() {
     stop();
 }
 
+void ClockSync::onSample(std::function<void(const Sample&)> callback) {
+    onSample_ = std::move(callback);
+}
+
 void ClockSync::stop() {
     asio::post(io_, [this] {
         socket_.close();
@@ -142,7 +146,10 @@ void ClockSync::reportStampMode() {
 
 void ClockSync::publishStats() {
     statPathDelay_.store(toSeconds(servo_.pathDelay()), std::memory_order_relaxed);
-    statGate_.store(toSeconds(servo_.gateThreshold()), std::memory_order_relaxed);
+    const auto gate = servo_.gateThreshold();
+    const bool gateSeeded = gate != std::chrono::nanoseconds::max();
+    statGate_.store(gateSeeded ? toSeconds(gate) : 0.0, std::memory_order_relaxed);
+    statGateSeeded_.store(gateSeeded, std::memory_order_relaxed);
     statKernelLag_.store(toSeconds(receiver_.kernelLag()), std::memory_order_relaxed);
     statRejected_.store(servo_.rejected(), std::memory_order_relaxed);
     statTooSoon_.store(servo_.tooSoon(), std::memory_order_relaxed);
@@ -155,7 +162,9 @@ void ClockSync::publishStats() {
         s.offset = m->masterRef - m->localRef;
     }
     s.pathDelay       = statPathDelay_.load(std::memory_order_relaxed);
-    s.gateThreshold   = statGate_.load(std::memory_order_relaxed);
+    if (statGateSeeded_.load(std::memory_order_relaxed)) {
+        s.gateThreshold = statGate_.load(std::memory_order_relaxed);
+    }
     s.kernelLag       = statKernelLag_.load(std::memory_order_relaxed);
     s.kernelTimestamps= statKernelStamps_.load(std::memory_order_relaxed);
     s.rejected        = statRejected_.load(std::memory_order_relaxed);
@@ -192,6 +201,7 @@ void ClockSync::armReceive() {
                 remote_ = r.from;
                 reportStampMode();          // one-shot, once probation settles
                 handleReceive(r.bytes, r.stamp);
+                publishStats();
             }
             armReceive();
         });
@@ -248,18 +258,21 @@ void ClockSync::handleReceive(std::size_t n, Clock::time_point t) {
             const auto L = (pending_.t3 + lastSync_.t2) / 2;
             const auto M = L - offset;
             servo_.addSample(toSeconds(L), toSeconds(M), delay);
-            publishStats();
 
             const auto mapping = servo_.mapping();
 
             if (mapping) {
                 updateMapping(mapping->localRef, mapping->masterRef, mapping->skew);
-                std::cout << toSeconds(offset) * 1e6 << " "                              // theta_raw, us
-                          << toSeconds(delay)  * 1e6 << " "                              // delay, us
-                          << -(mapping->masterRef - mapping->localRef) * 1e6 << " "      // theta from mapping
-                          << mapping->skew * 1e6 << " "                                  // ppm
-                          << servo_.rejected() << " "                                   // increments on reject
-                          << servo_.tooSoon() << "\n";
+                if (onSample_) {
+                    onSample_(Sample{
+                        .offset       = toSeconds(offset),
+                        .delay        = toSeconds(delay),
+                        .mappedOffset = -(mapping->masterRef - mapping->localRef),
+                        .skew         = mapping->skew,
+                        .rejected     = servo_.rejected(),
+                        .tooSoon      = servo_.tooSoon(),
+                    });
+                }
             }
 
         } else if (msg->type == MsgType::Sync) {
