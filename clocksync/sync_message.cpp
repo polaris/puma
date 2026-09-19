@@ -5,17 +5,6 @@
 namespace clocksync {
 namespace {
 
-constexpr std::size_t kOffMagic    =  0;
-constexpr std::size_t kOffVersion  =  4;
-constexpr std::size_t kOffType     =  5;
-constexpr std::size_t kOffDomain   =  6;
-constexpr std::size_t kOffFlags    =  7;
-constexpr std::size_t kOffNodeId   =  8;
-constexpr std::size_t kOffTargetId = 16;
-constexpr std::size_t kOffSeq      = 24;
-constexpr std::size_t kOffRefSeq   = 28;
-constexpr std::size_t kOffT        = 32;
-
 static_assert(kOffT + 8 == kMessageBytes, "layout and kMessageBytes disagree");
 
 bool knownType(std::uint8_t v) noexcept {

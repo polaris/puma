@@ -55,7 +55,7 @@ struct Sample {
 
 struct Config {
     asio::ip::udp::endpoint group;        // 239.255.0.2:12346 — not the audio group
-    net::Interface iface;
+    net::Interface iface;                 // Network interface
     std::uint8_t domain = 0;              // two systems, one LAN, no interference
     std::uint64_t nodeId = 0;             // used to ignore our own packets
     std::chrono::milliseconds syncInterval{125};        // 8/s
@@ -63,8 +63,7 @@ struct Config {
     double acquireBandwidth = 0.5;        // Hz
     double lockBandwidth    = 0.05;       // Hz
     bool loopback = true;                 // single-machine testing
-    // force the receiver to use timestamps taken in user space
-    bool forceUserspaceStamps = false;
+    bool useKernelspaceStamps = false;    // use timestamps taken in kernel space
 };
 
 struct SyncPair {                       // from the most recent Sync
@@ -140,7 +139,9 @@ private:
     Servo servo_;
     std::function<void(const Sample&)> onSample_;
 
-    void sendMessage(const SyncMessage& msg);
+    std::uint8_t syncMessageBuffer_[kMessageBytes];
+    std::uint8_t delayReqMessageBuffer_[kMessageBytes];
+    std::uint8_t delayRespMessageBuffer_[kMessageBytes];
 
     void armReceive();
     void handleReceive(std::size_t n, Clock::time_point t);

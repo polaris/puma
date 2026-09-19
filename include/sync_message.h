@@ -7,6 +7,17 @@
 
 namespace clocksync {
 
+constexpr std::size_t kOffMagic    =  0;
+constexpr std::size_t kOffVersion  =  4;
+constexpr std::size_t kOffType     =  5;
+constexpr std::size_t kOffDomain   =  6;
+constexpr std::size_t kOffFlags    =  7;
+constexpr std::size_t kOffNodeId   =  8;
+constexpr std::size_t kOffTargetId = 16;
+constexpr std::size_t kOffSeq      = 24;
+constexpr std::size_t kOffRefSeq   = 28;
+constexpr std::size_t kOffT        = 32;
+
 enum class MsgType : std::uint8_t {
     Sync      = 1,  ///< master -> group; t = t1 (send instant)
     DelayReq  = 2,  ///< slave  -> group; t = t3 (send instant)

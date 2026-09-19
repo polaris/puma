@@ -40,6 +40,9 @@ ClockSync::ClockSync(Config config, Role role)
 , noSync_{0}
 , staleSync_{0} {
     net::configureBidirectional(socket_, config.group, config.iface, {.hops = 1, .loopback = config.loopback});
+    encode({ .type = MsgType::Sync,      .domain = config_.domain, .nodeId = config_.nodeId, }, syncMessageBuffer_);
+    encode({ .type = MsgType::DelayReq,  .domain = config_.domain, .nodeId = config_.nodeId, }, delayReqMessageBuffer_);
+    encode({ .type = MsgType::DelayResp, .domain = config_.domain, .nodeId = config_.nodeId, }, delayRespMessageBuffer_);
 }
 
 void ClockSync::start() {
@@ -53,8 +56,9 @@ void ClockSync::start() {
     socket_.non_blocking(true);
     // Only reports that the socket option was accepted. Whether the stamps are
     // usable is decided by probation, and reported by reportStampMode().
-    if (!config_.forceUserspaceStamps)
+    if (config_.useKernelspaceStamps) {
         (void)receiver_.enableKernelTimestamps();
+    }
     armReceive();
     if (role_ == Role::Master) {
         armSyncTimer();
@@ -184,14 +188,6 @@ void ClockSync::publishStats() {
     return s;
 }
 
-void ClockSync::sendMessage(const SyncMessage& msg) {
-    std::uint8_t buf[kMessageBytes];
-    encode(msg, buf);
-    asio::error_code ec;
-    socket_.send_to(asio::buffer(buf, kMessageBytes), config_.group, 0, ec);
-    if (ec) { /* TODO: count it, don't throw */ }
-}
-
 void ClockSync::armReceive() {
     if (stopping_) return;
     socket_.async_wait(asio::ip::udp::socket::wait_read,
@@ -220,16 +216,12 @@ void ClockSync::handleReceive(std::size_t n, Clock::time_point t) {
     if (msg->nodeId == config_.nodeId) return;
     if (role_ == Role::Master) {
         if (msg->type == MsgType::DelayReq) {
-            SyncMessage out{
-                .type = MsgType::DelayResp,
-                .domain = config_.domain,
-                .nodeId = config_.nodeId,
-                .targetId = msg->nodeId,
-                .seq = sequence_++,
-                .refSeq = msg->seq,
-                .t = toNanos(t),
-            };
-            sendMessage(out);
+            put_u64(delayRespMessageBuffer_ + kOffTargetId, msg->nodeId);
+            put_u32(delayRespMessageBuffer_ + kOffSeq, sequence_++);
+            put_u32(delayRespMessageBuffer_ + kOffRefSeq, msg->seq);
+            put_u64(delayRespMessageBuffer_ + kOffT, toNanos(t));
+            asio::error_code ec;
+            socket_.send_to(asio::buffer(delayRespMessageBuffer_, kMessageBytes), config_.group, 0, ec);
         }
     } else {
         if (msg->type == MsgType::DelayResp) {
@@ -304,15 +296,11 @@ void ClockSync::armSyncTimer() {
 }
 
 void ClockSync::sendSync() {
+    put_u32(syncMessageBuffer_ + kOffSeq, sequence_++);
     const auto t = Clock::now();
-    SyncMessage msg{
-        .type = MsgType::Sync,
-        .domain = config_.domain,
-        .nodeId = config_.nodeId,
-        .seq = sequence_++,
-        .t = toNanos(t),
-    };
-    sendMessage(msg);
+    put_u64(syncMessageBuffer_ + kOffT, toNanos(t));
+    asio::error_code ec;
+    socket_.send_to(asio::buffer(syncMessageBuffer_, kMessageBytes), config_.group, 0, ec);
 }
 
 void ClockSync::armDelayReqTimer() {
@@ -328,20 +316,17 @@ void ClockSync::armDelayReqTimer() {
 }
 
 void ClockSync::sendDelayReq() {
+    const auto seq = sequence_++;
+    put_u32(delayReqMessageBuffer_ + kOffSeq, seq);
     const auto t = Clock::now();
-    SyncMessage msg{
-        .type = MsgType::DelayReq,
-        .domain = config_.domain,
-        .nodeId = config_.nodeId,
-        .seq = sequence_++,
-        .t = toNanos(t),
-    };
+    put_u64(delayReqMessageBuffer_ + kOffT, toNanos(t));
+    asio::error_code ec;
+    socket_.send_to(asio::buffer(delayReqMessageBuffer_, kMessageBytes), config_.group, 0, ec);
     pending_ = {
         .t3 = sinceEpoch(t),
-        .seq = msg.seq,
+        .seq = seq,
         .valid = true
     };
-    sendMessage(msg);
 }
 
 }

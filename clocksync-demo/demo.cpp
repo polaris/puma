@@ -108,7 +108,7 @@ int main(int argc, char** argv) {
     int delayReqInterval = kDefaultDelayReqInterval;
     double acquireBandwidth = kDefaultAcquireBandwidth;
     double lockBandwidth = kDefaultLockBandwidth;
-    bool forceUserspaceStamps = false;
+    bool useKernelspaceStamps = false;
 
     app.add_option("-i,--interface", ifName, "Network interface");
     app.add_option("-n,--nodeid", nodeId, "Node ID")
@@ -141,7 +141,7 @@ int main(int argc, char** argv) {
     app.add_option("--lockBandwidth", lockBandwidth, "Lock bandwidth")
         ->check(CLI::PositiveNumber)
         ->default_val(kDefaultLockBandwidth);
-    app.add_flag("--forceUserspaceStamps", forceUserspaceStamps, "Force user space timestapms");
+    app.add_flag("--useKernelspaceStamps", useKernelspaceStamps, "Use kernel space timestapms");
     CLI11_PARSE(app, argc, argv);  // handles --help, errors, exit codes
 
     // Everything below can throw: enumerate() and the ClockSync constructor,
@@ -174,7 +174,7 @@ int main(int argc, char** argv) {
             .acquireBandwidth = acquireBandwidth,
             .lockBandwidth = lockBandwidth,
             .loopback = loopback,
-            .forceUserspaceStamps = forceUserspaceStamps,
+            .useKernelspaceStamps = useKernelspaceStamps,
         };
         clocksync::ClockSync cs{config, role};
         cs.onSample(logSample);   // before start(): read from the io thread
