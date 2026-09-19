@@ -11,6 +11,7 @@
 #include <chrono>
 #include <functional>
 #include <optional>
+#include <random>
 
 namespace clocksync {
 
@@ -31,6 +32,18 @@ struct Stats {
     // belongs in the diagnostics rather than being inferred from a odd offset.
     bool   kernelTimestamps = false;
     double kernelLag        = 0.0;   // seconds of receive-path latency removed
+
+    // Per-node signature, from our own loopback datagrams. theta between two
+    // nodes is the difference of their signatures, so receiver-to-receiver
+    // agreement is limited by how much these differ, not by how large either
+    // one is. Observable before any of it reaches the audio path.
+    double txProbeFloor     = 0.0;   // seconds, best (transmit + loopback)
+    std::uint64_t txProbes  = 0;
+
+    // Per-leg floors. floorA - floorB is twice the systematic offset the
+    // two-way exchange cannot detect.
+    double floorA           = 0.0;   // seconds, master -> slave
+    double floorB           = 0.0;   // seconds, slave  -> master
 
     std::uint64_t rejected  = 0;  // dropped by the delay gate
     std::uint64_t tooSoon   = 0;  // sample interval implausibly short
@@ -122,6 +135,27 @@ private:
     PendingRequest pending_;
 
     std::atomic<std::uint64_t> unmatched_, noSync_, staleSync_;
+
+    std::mt19937 rng_;
+
+    // TX self-probe. With loopback on, every node also receives its own
+    // datagrams; the nodeId filter drops them. Timing them costs nothing and
+    // gives (transmit path + loopback): with kernel RX stamps that is close to
+    // this node's transmit latency, with userspace stamps its whole local
+    // stack. Either way two nodes can be compared.
+    struct SentRecord { std::uint32_t seq = 0; std::chrono::nanoseconds t{}; bool valid = false; };
+    static constexpr std::size_t kSentHistory = 16;
+    std::array<SentRecord, kSentHistory> sent_{};
+    std::size_t sentNext_ = 0;
+
+    void recordSent(std::uint32_t seq, std::chrono::nanoseconds t) noexcept;
+    [[nodiscard]] std::optional<std::chrono::nanoseconds> sentAt(std::uint32_t seq) const noexcept;
+    void probeOwnPacket(const SyncMessage& msg, Clock::time_point arrival);
+
+    std::atomic<std::uint64_t> txProbeCount_{0};
+    std::atomic<double> txProbeFloor_{0.0};
+    std::atomic<double> statFloorA_{0.0};
+    std::atomic<double> statFloorB_{0.0};
 
     // Diagnostics are produced on the io thread and read from whatever thread
     // calls stats(); mirror them into atomics rather than racing on the Servo

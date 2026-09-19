@@ -17,9 +17,8 @@ void Servo::reset() {
     state_ = State{};
     acquireStart_ = 0.0;
     seedCount_ = 0;
-    delays_.fill(std::chrono::nanoseconds{0});
-    delayCount_ = 0;
-    delayNext_  = 0;
+    legA_.reset();
+    legB_.reset();
     pathDelay_  = std::chrono::nanoseconds{0};
     gateThreshold_ = std::chrono::nanoseconds::max();
     accepted_ = 0;
@@ -28,12 +27,44 @@ void Servo::reset() {
     consecutiveLarge_ = 0;
 }
 
+void Servo::Window::add(std::chrono::nanoseconds v) {
+    v_[next_] = v;
+    next_ = (next_ + 1) % kSize;
+    if (count_ < kSize) ++count_;
+
+    std::array<std::chrono::nanoseconds, kSize> sorted{};
+    std::copy_n(v_.begin(), count_, sorted.begin());
+    std::sort(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(count_));
+
+    floor_ = sorted[0];
+    const auto median = sorted[count_ / 2];
+    threshold_ = floor_ + std::chrono::nanoseconds{static_cast<std::int64_t>(
+        kGateK * static_cast<double>((median - floor_).count()))};
+}
+
+void Servo::Window::reset() {
+    v_.fill(std::chrono::nanoseconds{0});
+    count_ = 0;
+    next_  = 0;
+    floor_ = std::chrono::nanoseconds{0};
+    threshold_ = std::chrono::nanoseconds::max();
+}
+
 void Servo::addSample(double localSeconds, double masterSeconds,
-                      std::chrono::nanoseconds delay) {
+                      std::chrono::nanoseconds a, std::chrono::nanoseconds b) {
+    const auto delay = (a + b) / 2;   // seeding and reporting still use the mean
+    legA_.add(a);
+    legB_.add(b);
     // 1. window first: the gate below depends on it. Rejected samples still
     //    inform the window, otherwise a period of high delay would never be
     //    reflected in the threshold and the gate would reject everything.
-    updateDelayWindow(delay);
+    // Keep pathDelay()/gateThreshold() meaningful for Stats and for sizing the
+    // audio buffer by combining the two legs.
+    pathDelay_     = (legA_.floor() + legB_.floor()) / 2;
+    gateThreshold_ = (legA_.threshold() == std::chrono::nanoseconds::max() ||
+                      legB_.threshold() == std::chrono::nanoseconds::max())
+                   ? std::chrono::nanoseconds::max()
+                   : (legA_.threshold() + legB_.threshold()) / 2;
 
     // 2. seeding
     if (!current_) {
@@ -48,7 +79,14 @@ void Servo::addSample(double localSeconds, double masterSeconds,
     }
 
     // 3. now the gate is meaningful
-    if (gateActive() && delay > gateThreshold_) { ++rejected_; return; }
+    // Gate each direction against its own floor. A sample where one leg was
+    // queued and the other was not is exactly the asymmetric case, and it
+    // passes a gate on the average; this catches it.
+    if (legA_.active() && legB_.active() &&
+        (a > legA_.threshold() || b > legB_.threshold())) {
+        ++rejected_;
+        return;
+    }
 
     const double T = localSeconds - current_->localRef;
     if (T < 0.01) {
@@ -60,8 +98,8 @@ void Servo::addSample(double localSeconds, double masterSeconds,
     const double bw = lockBw_ + (acquireBw_ - lockBw_) * std::exp(-elapsed / 2.0);
     double w = 2.0 * std::numbers::pi * bw * T;
     if (w > 0.4) w = 0.4;
-    const double b = std::numbers::sqrt2 * w;
-    const double cOverT = w * w / T;
+    const double gainP = std::numbers::sqrt2 * w;   // proportional
+    const double gainI = w * w / T;                 // integral, per second
 
     const double predicted = localToMaster(localSeconds, *current_);
     const double e = masterSeconds - predicted;
@@ -73,8 +111,8 @@ void Servo::addSample(double localSeconds, double masterSeconds,
     }
 
     current_->localRef  = localSeconds;
-    current_->masterRef = predicted + b * e;
-    current_->skew     += cOverT * e;
+    current_->masterRef = predicted + gainP * e;
+    current_->skew     += gainI * e;
 
     ++accepted_;
     if (state_.value == State::Acquiring &&
@@ -91,25 +129,12 @@ State Servo::state() const {
     return state_;
 }
 
-void Servo::updateDelayWindow(std::chrono::nanoseconds delay) {
-    delays_[delayNext_] = delay;
-    delayNext_ = (delayNext_ + 1) % kDelayWindow;
-    if (delayCount_ < kDelayWindow) ++delayCount_;
-
-    std::array<std::chrono::nanoseconds, kDelayWindow> sorted{};
-    std::copy_n(delays_.begin(), delayCount_, sorted.begin());
-    std::sort(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(delayCount_));
-
-    pathDelay_ = sorted[0];
-    const auto median = sorted[delayCount_ / 2];
-    const auto spread = median - pathDelay_;
-    gateThreshold_ = pathDelay_ + std::chrono::nanoseconds{
-        static_cast<std::int64_t>(kGateK * static_cast<double>(spread.count()))};
-}
 
 std::chrono::nanoseconds Servo::pathDelay() const { return pathDelay_; }
 std::chrono::nanoseconds Servo::gateThreshold() const { return gateThreshold_; }
-bool Servo::gateActive() const { return delayCount_ >= kMinForGate; }
+bool Servo::gateActive() const { return legA_.active() && legB_.active(); }
+std::chrono::nanoseconds Servo::floorA() const { return legA_.floor(); }
+std::chrono::nanoseconds Servo::floorB() const { return legB_.floor(); }
 std::uint64_t Servo::rejected() const { return rejected_; }
 std::uint64_t Servo::tooSoon() const { return tooSoon_; }
 

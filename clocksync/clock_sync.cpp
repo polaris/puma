@@ -1,6 +1,7 @@
 #include "clock_sync.h"
 #include "byte_order.h"
 
+#include <chrono>
 #include <iostream>
 
 #if defined(_WIN32)
@@ -38,7 +39,8 @@ ClockSync::ClockSync(Config config, Role role)
 , skew_{0}
 , unmatched_{0}
 , noSync_{0}
-, staleSync_{0} {
+, staleSync_{0}
+, rng_{static_cast<unsigned int>(config.nodeId)} {
     net::configureBidirectional(socket_, config.group, config.iface, {.hops = 1, .loopback = config.loopback});
     encode({ .type = MsgType::Sync,      .domain = config_.domain, .nodeId = config_.nodeId, }, syncMessageBuffer_);
     encode({ .type = MsgType::DelayReq,  .domain = config_.domain, .nodeId = config_.nodeId, }, delayReqMessageBuffer_);
@@ -159,6 +161,8 @@ void ClockSync::publishStats() {
                     std::memory_order_relaxed);
     statGateSeeded_.store(gateSeeded, std::memory_order_relaxed);
     statKernelLag_.store(toSeconds(receiver_.kernelLag()), std::memory_order_relaxed);
+    statFloorA_.store(toSeconds(servo_.floorA()), std::memory_order_relaxed);
+    statFloorB_.store(toSeconds(servo_.floorB()), std::memory_order_relaxed);
     statRejected_.store(servo_.rejected(), std::memory_order_relaxed);
     statTooSoon_.store(servo_.tooSoon(), std::memory_order_relaxed);
     statKernelStamps_.store(receiver_.kernelTimestamps(), std::memory_order_relaxed);
@@ -175,6 +179,10 @@ void ClockSync::publishStats() {
     }
     s.kernelLag       = statKernelLag_.load(std::memory_order_relaxed);
     s.kernelTimestamps= statKernelStamps_.load(std::memory_order_relaxed);
+    s.txProbeFloor    = txProbeFloor_.load(std::memory_order_relaxed);
+    s.txProbes        = txProbeCount_.load(std::memory_order_relaxed);
+    s.floorA          = statFloorA_.load(std::memory_order_relaxed);
+    s.floorB          = statFloorB_.load(std::memory_order_relaxed);
     s.rejected        = statRejected_.load(std::memory_order_relaxed);
     s.tooSoon         = statTooSoon_.load(std::memory_order_relaxed);
     s.unmatched       = unmatched_.load(std::memory_order_relaxed);
@@ -213,13 +221,17 @@ void ClockSync::handleReceive(std::size_t n, Clock::time_point t) {
     const auto msg = decode(buffer_.data(), n);
     if (msg == std::nullopt) return;
     if (msg->domain != config_.domain) return;
-    if (msg->nodeId == config_.nodeId) return;
+    if (msg->nodeId == config_.nodeId) {
+        probeOwnPacket(*msg, t);    // our own loopback copy: time it, then drop
+        return;
+    }
     if (role_ == Role::Master) {
         if (msg->type == MsgType::DelayReq) {
             put_u64(delayRespMessageBuffer_ + kOffTargetId, msg->nodeId);
             put_u32(delayRespMessageBuffer_ + kOffSeq, sequence_++);
             put_u32(delayRespMessageBuffer_ + kOffRefSeq, msg->seq);
             put_u64(delayRespMessageBuffer_ + kOffT, toNanos(t));
+            recordSent(get_u32(delayRespMessageBuffer_ + kOffSeq), sinceEpoch(t));
             asio::error_code ec;
             socket_.send_to(asio::buffer(delayRespMessageBuffer_, kMessageBytes), config_.group, 0, ec);
         }
@@ -255,7 +267,7 @@ void ClockSync::handleReceive(std::size_t n, Clock::time_point t) {
 
             const auto L = (pending_.t3 + lastSync_.t2) / 2;
             const auto M = L - offset;
-            servo_.addSample(toSeconds(L), toSeconds(M), delay);
+            servo_.addSample(toSeconds(L), toSeconds(M), a, b);
 
             const auto mapping = servo_.mapping();
 
@@ -295,17 +307,44 @@ void ClockSync::armSyncTimer() {
     });
 }
 
+void ClockSync::recordSent(std::uint32_t seq, std::chrono::nanoseconds t) noexcept {
+    sent_[sentNext_] = {seq, t, true};
+    sentNext_ = (sentNext_ + 1) % kSentHistory;
+}
+
+std::optional<std::chrono::nanoseconds>
+ClockSync::sentAt(std::uint32_t seq) const noexcept {
+    for (const auto& r : sent_) {
+        if (r.valid && r.seq == seq) return r.t;
+    }
+    return std::nullopt;
+}
+
+void ClockSync::probeOwnPacket(const SyncMessage& msg, Clock::time_point arrival) {
+    const auto sent = sentAt(msg.seq);
+    if (!sent) return;                        // fell out of the short history
+    const auto rtt = sinceEpoch(arrival) - *sent;
+    if (rtt.count() <= 0) return;             // nonsensical; ignore
+    const double s = toSeconds(rtt);
+    const double f = txProbeFloor_.load(std::memory_order_relaxed);
+    if (f == 0.0 || s < f) txProbeFloor_.store(s, std::memory_order_relaxed);
+    txProbeCount_.fetch_add(1, std::memory_order_relaxed);
+}
+
 void ClockSync::sendSync() {
     put_u32(syncMessageBuffer_ + kOffSeq, sequence_++);
     const auto t = Clock::now();
     put_u64(syncMessageBuffer_ + kOffT, toNanos(t));
+    recordSent(get_u32(syncMessageBuffer_ + kOffSeq), sinceEpoch(t));
     asio::error_code ec;
     socket_.send_to(asio::buffer(syncMessageBuffer_, kMessageBytes), config_.group, 0, ec);
 }
 
 void ClockSync::armDelayReqTimer() {
     if (stopping_) return;
-    deadline_ += config_.delayReqInterval;
+    std::uniform_real_distribution<double> jitter(0.5, 1.5);
+    const auto step = std::chrono::duration_cast<Clock::duration>(config_.delayReqInterval * jitter(rng_));
+    deadline_ += step;
     timer_.expires_at(deadline_);
     timer_.async_wait([this](const asio::error_code& ec) {
         if (stopping_) return;
@@ -320,6 +359,7 @@ void ClockSync::sendDelayReq() {
     put_u32(delayReqMessageBuffer_ + kOffSeq, seq);
     const auto t = Clock::now();
     put_u64(delayReqMessageBuffer_ + kOffT, toNanos(t));
+    recordSent(seq, sinceEpoch(t));
     asio::error_code ec;
     socket_.send_to(asio::buffer(delayReqMessageBuffer_, kMessageBytes), config_.group, 0, ec);
     pending_ = {
