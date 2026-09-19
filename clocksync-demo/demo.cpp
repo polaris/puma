@@ -70,6 +70,7 @@ void printStatus(const clocksync::Stats& s) {
               << "  unmatched=" << s.unmatched
               << "  noSync=" << s.noSync
               << "  staleSync=" << s.staleSync
+              << "  floorA/floorB=" << s.floorA / s.floorB
               << "  dropped=" << dropped.load(std::memory_order_relaxed)
               << "\n";
 }
