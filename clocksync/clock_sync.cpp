@@ -46,6 +46,7 @@ void ClockSync::start() {
     if (worker_.joinable()) {
         return;
     }
+    stopping_ = false;
     deadline_ = Clock::now();
     sequence_ = 0;
     servo_.configure(config_.acquireBandwidth, config_.lockBandwidth);
@@ -77,8 +78,10 @@ void ClockSync::onSample(std::function<void(const Sample&)> callback) {
 
 void ClockSync::stop() {
     asio::post(io_, [this] {
+        stopping_ = true;
         socket_.close();
         timer_.cancel();
+        io_.stop();   // backstop: run() returns even if a handler re-armed
     });
     if (worker_.joinable()) {
         worker_.join();
@@ -190,8 +193,10 @@ void ClockSync::sendMessage(const SyncMessage& msg) {
 }
 
 void ClockSync::armReceive() {
+    if (stopping_) return;
     socket_.async_wait(asio::ip::udp::socket::wait_read,
         [this](const asio::error_code& ec) {
+            if (stopping_) return;
             if (ec == asio::error::operation_aborted) return;
             if (ec) { armReceive(); return; }
 
@@ -287,9 +292,11 @@ void ClockSync::handleReceive(std::size_t n, Clock::time_point t) {
 }
 
 void ClockSync::armSyncTimer() {
+    if (stopping_) return;
     deadline_ += config_.syncInterval;
     timer_.expires_at(deadline_);
     timer_.async_wait([this](const asio::error_code& ec) {
+        if (stopping_) return;
         if (ec == asio::error::operation_aborted) return;
         sendSync();
         armSyncTimer();
@@ -309,9 +316,11 @@ void ClockSync::sendSync() {
 }
 
 void ClockSync::armDelayReqTimer() {
+    if (stopping_) return;
     deadline_ += config_.delayReqInterval;
     timer_.expires_at(deadline_);
     timer_.async_wait([this](const asio::error_code& ec) {
+        if (stopping_) return;
         if (ec == asio::error::operation_aborted) return;
         sendDelayReq();
         armDelayReqTimer();

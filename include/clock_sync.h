@@ -101,6 +101,12 @@ private:
     TimestampedReceiver receiver_;
     std::thread worker_;
 
+    // Set inside the lambda stop() posts, so it is only ever touched on the io
+    // thread. operation_aborted is not enough on its own: a completion already
+    // queued with no error when stop() runs would re-arm afterwards, and that
+    // work is never cancelled, so io_.run() never returns and join() hangs.
+    bool stopping_ = false;
+
     Config config_;
     Role role_;
 
