@@ -52,7 +52,8 @@ void ClockSync::start() {
     socket_.non_blocking(true);
     // Only reports that the socket option was accepted. Whether the stamps are
     // usable is decided by probation, and reported by reportStampMode().
-    (void)receiver_.enableKernelTimestamps();
+    if (!config_.forceUserspaceStamps)
+        (void)receiver_.enableKernelTimestamps();
     armReceive();
     if (role_ == Role::Master) {
         armSyncTimer();

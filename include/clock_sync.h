@@ -63,6 +63,8 @@ struct Config {
     double acquireBandwidth = 0.5;        // Hz
     double lockBandwidth    = 0.05;       // Hz
     bool loopback = true;                 // single-machine testing
+    // force the receiver to use timestamps taken in user space
+    bool forceUserspaceStamps = false;
 };
 
 struct SyncPair {                       // from the most recent Sync
