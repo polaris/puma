@@ -6,6 +6,9 @@
 #include <cstdint>
 #include <optional>
 
+constexpr double kDefaultAcquireBandwidth = 0.5;
+constexpr double kDefaultLockBandwidth = 0.05;
+
 struct ClockMapping {
     double localRef;     // a local steady_clock instant, seconds
     double masterRef;    // the master time at that instant
@@ -19,7 +22,6 @@ struct State {
 
 class Servo {
 public:
-    Servo();
     void configure(double acquireBandwidthHz, double lockBandwidthHz);
     void reset();
     /// a = t2-t1 (master->slave leg), b = t4-t3 (slave->master leg). Both are
@@ -59,10 +61,10 @@ public:
     [[nodiscard]] std::uint64_t tooSoon() const;
 
 private:
-    State state_;
-    double acquireBw_;
-    double lockBw_;
-    double acquireStart_;
+    State state_ = {};
+    double acquireBw_ = kDefaultAcquireBandwidth;
+    double lockBw_ = kDefaultLockBandwidth;
+    double acquireStart_ = 0.0;
     std::optional<ClockMapping> current_;
 
     // Delay tracking. A rolling window gives both the path-delay estimate (its

@@ -3,10 +3,6 @@
 #include <cmath>
 #include <numbers>
 
-Servo::Servo() : state_{}, acquireStart_{0.0} {
-
-}
-
 void Servo::configure(double acquireBandwidthHz, double lockBandwidthHz) {
     acquireBw_ = acquireBandwidthHz;
     lockBw_    = lockBandwidthHz;
@@ -96,7 +92,8 @@ void Servo::addSample(double localSeconds, double masterSeconds,
 
     const double elapsed = localSeconds - acquireStart_;
     const double bw = lockBw_ + (acquireBw_ - lockBw_) * std::exp(-elapsed / 2.0);
-    double w = 2.0 * std::numbers::pi * bw * T;
+    const double w_n = 2.0 * std::numbers::pi * bw;
+    double w = w_n * T;
     if (w > 0.4) w = 0.4;
     const double gainP = std::numbers::sqrt2 * w;   // proportional
     const double gainI = w * w / T;                 // integral, per second

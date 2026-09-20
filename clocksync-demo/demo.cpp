@@ -84,8 +84,6 @@ constexpr int kDefaultSyncInterval = 125;
 constexpr int kDefaultDelayReqInterval = 125;
 constexpr int kDefaultNodeId = 0;
 constexpr int kDefaultDomain = 0;
-constexpr double kDefaultAcquireBandwidth = 0.5;
-constexpr double kDefaultLockBandwidth = 0.05;
 
 constexpr auto kStatusInterval = std::chrono::seconds{5};
 constexpr auto kSampleLogInterval = std::chrono::milliseconds{100};

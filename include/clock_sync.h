@@ -73,8 +73,8 @@ struct Config {
     std::uint64_t nodeId = 0;             // used to ignore our own packets
     std::chrono::milliseconds syncInterval{125};        // 8/s
     std::chrono::milliseconds delayReqInterval{125};    // 8/s
-    double acquireBandwidth = 0.5;        // Hz
-    double lockBandwidth    = 0.05;       // Hz
+    double acquireBandwidth = kDefaultAcquireBandwidth; // Hz
+    double lockBandwidth    = kDefaultLockBandwidth;    // Hz
     bool loopback = true;                 // single-machine testing
     bool useKernelspaceStamps = false;    // use timestamps taken in kernel space
 };
