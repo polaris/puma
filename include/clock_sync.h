@@ -150,10 +150,7 @@ private:
 
     void recordSent(std::uint32_t seq, std::chrono::nanoseconds t) noexcept;
     [[nodiscard]] std::optional<std::chrono::nanoseconds> sentAt(std::uint32_t seq) const noexcept;
-    void probeOwnPacket(const SyncMessage& msg, Clock::time_point arrival);
 
-    std::atomic<std::uint64_t> txProbeCount_{0};
-    std::atomic<double> txProbeFloor_{0.0};
     std::atomic<double> statFloorA_{0.0};
     std::atomic<double> statFloorB_{0.0};
 

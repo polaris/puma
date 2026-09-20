@@ -179,8 +179,6 @@ void ClockSync::publishStats() {
     }
     s.kernelLag       = statKernelLag_.load(std::memory_order_relaxed);
     s.kernelTimestamps= statKernelStamps_.load(std::memory_order_relaxed);
-    s.txProbeFloor    = txProbeFloor_.load(std::memory_order_relaxed);
-    s.txProbes        = txProbeCount_.load(std::memory_order_relaxed);
     s.floorA          = statFloorA_.load(std::memory_order_relaxed);
     s.floorB          = statFloorB_.load(std::memory_order_relaxed);
     s.rejected        = statRejected_.load(std::memory_order_relaxed);
@@ -222,7 +220,6 @@ void ClockSync::handleReceive(std::size_t n, Clock::time_point t) {
     if (msg == std::nullopt) return;
     if (msg->domain != config_.domain) return;
     if (msg->nodeId == config_.nodeId) {
-        probeOwnPacket(*msg, t);    // our own loopback copy: time it, then drop
         return;
     }
     if (role_ == Role::Master) {
@@ -318,17 +315,6 @@ ClockSync::sentAt(std::uint32_t seq) const noexcept {
         if (r.valid && r.seq == seq) return r.t;
     }
     return std::nullopt;
-}
-
-void ClockSync::probeOwnPacket(const SyncMessage& msg, Clock::time_point arrival) {
-    const auto sent = sentAt(msg.seq);
-    if (!sent) return;                        // fell out of the short history
-    const auto rtt = sinceEpoch(arrival) - *sent;
-    if (rtt.count() <= 0) return;             // nonsensical; ignore
-    const double s = toSeconds(rtt);
-    const double f = txProbeFloor_.load(std::memory_order_relaxed);
-    if (f == 0.0 || s < f) txProbeFloor_.store(s, std::memory_order_relaxed);
-    txProbeCount_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void ClockSync::sendSync() {
