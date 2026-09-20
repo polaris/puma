@@ -11,6 +11,8 @@
 #define MA_IMPLEMENTATION
 #include <miniaudio.h>
 
+#include "audio_context.h"
+#include "audio_player.h"
 #include "netint.h"
 #include "time_filter.h"
 
@@ -25,52 +27,32 @@ constexpr unsigned int kPeriodSizeInFrames = 240;
 constexpr unsigned int kNumPeriods = 3;
 
 void enumerateNetworkInterfaces();
-void enumerateOutputDevices(ma_uint32 playbackCount, ma_device_info *playbackInfos);
-
-// Silence for now: the received packets still go straight to the WAV file.
-// Feeding them to the device is what the resampler in front of this will do.
-void data_callback(ma_device* device, void* output, const void* input, ma_uint32 frameCount) {
-    (void)input;
-    ma_silence_pcm_frames(output, frameCount, device->playback.format, device->playback.channels);
-}
+void enumerateOutputDevices(const AudioContext& audio);
 
 int main(int argc, char** argv) {
     CLI::App app{"Receiver"};
     argv = app.ensure_utf8(argv);
 
-    ma_context context;
-    if (ma_context_init(nullptr, 0, nullptr, &context) != MA_SUCCESS) {
+    AudioContext audio;
+    if (!audio.init()) {
         std::cerr << "Failed to initialise the audio context\n";
         return 2;
     }
-
-    ma_device_info* playbackInfos = nullptr;
-    ma_uint32 playbackDeviceCount = 0;
-    ma_device_info* captureInfos = nullptr;
-    ma_uint32 captureDeviceCount = 0;
-    if (ma_context_get_devices(&context, &playbackInfos, &playbackDeviceCount, &captureInfos, &captureDeviceCount) != MA_SUCCESS) {
-        std::cerr << "Failed to enumerate audio devices\n";
-        ma_context_uninit(&context);
-        return 2;
-    }
-    if (playbackDeviceCount == 0) {
+    if (audio.playbackCount() == 0) {
         std::cerr << "No audio playback devices available\n";
-        ma_context_uninit(&context);
         return 2;
     }
 
     app.add_flag("--enumOutputDevices",
-        [&context, playbackDeviceCount, playbackInfos] (int64_t) {
-            enumerateOutputDevices(playbackDeviceCount, playbackInfos);
-            ma_context_uninit(&context);
-            exit(0);
+        [&audio] (int64_t) {
+            enumerateOutputDevices(audio);
+            throw CLI::Success();
         }, "Enumerate audio output devices")
         ->trigger_on_parse();
     app.add_flag("--enumNetworkInterfaces",
-        [&context] (int64_t) {
+        [] (int64_t) {
             enumerateNetworkInterfaces();
-            ma_context_uninit(&context);
-            exit(0);
+            throw CLI::Success();
         }, "Enumerate network interfaces")
         ->trigger_on_parse();
 
@@ -98,16 +80,14 @@ int main(int argc, char** argv) {
     
     CLI11_PARSE(app, argc, argv);
 
-    if (outputDeviceIndex >= playbackDeviceCount) {
+    if (outputDeviceIndex >= audio.playbackCount()) {
         std::cerr << "Output device with index " << outputDeviceIndex << " not available\n";
-        ma_context_uninit(&context);
         return 2;
     }
 
     const auto chosen = !networkInterface.empty() ? net::find(networkInterface) : net::selectDefault();
     if (!chosen) {
         std::cerr << (!networkInterface.empty() ? "No such interface\n" : "Ambiguous or none; name one explicitly\n");
-        ma_context_uninit(&context);
         return 1;
     }
     std::cout << "Using network interface " << chosen->name << " " << chosen->address.to_string() << "\n";
@@ -118,31 +98,27 @@ int main(int argc, char** argv) {
     net::configureReceiver(rx, group, *chosen);
     std::cout << "Receiver configured\n";
 
-    ma_device_config config    = ma_device_config_init(ma_device_type_playback);
-    config.playback.pDeviceID  = &playbackInfos[outputDeviceIndex].id;
-    config.playback.format     = ma_format_s16;
-    config.playback.channels   = 0;     // native
-    config.sampleRate          = senderSampleRate;
-    config.periodSizeInFrames  = periodSizeInFrames;
-    config.periods             = kNumPeriods;
-    config.performanceProfile  = ma_performance_profile_low_latency;
-    config.dataCallback        = data_callback;
+    AudioPlayer::Config playerConfig;
+    playerConfig.format             = ma_format_s16;
+    playerConfig.channels           = 0;     // native
+    playerConfig.sampleRate         = senderSampleRate;
+    playerConfig.periodSizeInFrames = periodSizeInFrames;
+    playerConfig.periods            = kNumPeriods;
 
-    ma_device device;
-    if (ma_device_init(&context, &config, &device) != MA_SUCCESS) {
+    // No data callback yet: the received packets still go straight to the WAV
+    // file, so the device plays silence. Feeding it is what the resampler in
+    // front of this will do.
+    AudioPlayer player;
+    if (!player.open(audio, audio.playbackInfo(outputDeviceIndex).id, playerConfig)) {
         std::cerr << "Failed to open the selected output device\n";
-        ma_context_uninit(&context);
         return 2;
     }
-    if (device.sampleRate != senderSampleRate) {
-        std::cerr << "Output device runs at " << device.sampleRate << " Hz, but the sender uses "
-                  << senderSampleRate << " Hz\n";
-        ma_device_uninit(&device);
-        ma_context_uninit(&context);
+    if (player.internalSampleRate() != senderSampleRate) {
+        std::cerr << "Output device runs at " << player.internalSampleRate()
+                  << " Hz, but the sender uses " << senderSampleRate << " Hz\n";
         return 2;
     }
-    std::cout << "playback: " << device.playback.channels << " ch s16 @ "
-              << device.sampleRate << " Hz\n";
+    std::cout << "playback: " << player.channels() << " ch s16 @ " << player.sampleRate() << " Hz\n";
 
     const auto origin  = Clock::now();
     const auto seconds = [origin](Clock::time_point tp) {
@@ -156,11 +132,12 @@ int main(int argc, char** argv) {
 
     std::uint32_t expectedSeq = 0;
     std::uint64_t discontinuities = 0;
+    bool stopping = false;      // io thread only, set by the teardown below
 
     std::function<void()> arm = [&] {
         rx.async_receive(asio::buffer(buf),
             [&](const asio::error_code& ec, std::size_t n) {
-                if (ec == asio::error::operation_aborted) {
+                if (stopping || ec == asio::error::operation_aborted) {
                     return;
                 }
                 if (ec) { 
@@ -240,44 +217,54 @@ int main(int argc, char** argv) {
             });
     };
 
-    if (ma_device_start(&device) != MA_SUCCESS) {
+    if (!player.start()) {
         std::cerr << "Failed to start the playback device\n";
-        ma_device_uninit(&device);
-        ma_context_uninit(&context);
         return 2;
     }
 
     arm();
     std::thread worker([&]{ io.run(); });
 
-    std::cin.get();
+    asio::io_context wait;
+    asio::signal_set signals{wait, SIGINT, SIGTERM};
+    signals.async_wait([&](auto, int) {
+        std::cerr << "\nshutting down\n";
+        wait.stop();
+    });
 
-    ma_device_stop(&device);
-    ma_device_uninit(&device);
-    ma_context_uninit(&context);
+    wait.run();
 
-    asio::post(io, [&]{ rx.close(); });         // close from inside the io thread
+    player.stop();
+
+    // Close from inside the io thread, and latch the flag first so nothing
+    // re-arms afterwards. close() here is the non-throwing overload: an
+    // exception escaping a handler would take down io.run().
+    asio::post(io, [&]{
+        stopping = true;
+        asio::error_code ignored;
+        rx.close(ignored);
+    });
     worker.join();
 
     return 0;
 }
 
-void enumerateOutputDevices(ma_uint32 playbackDeviceCount, ma_device_info *playbackInfos) {
-    for (ma_uint32 deviceIndex = 0; deviceIndex < playbackDeviceCount; deviceIndex += 1) {
-        std::cout << deviceIndex << " - " << playbackInfos[deviceIndex].name
-                  << (playbackInfos[deviceIndex].isDefault ? " (default)" : "") << "\n";
+void enumerateOutputDevices(const AudioContext& audio) {
+    for (ma_uint32 deviceIndex = 0; deviceIndex < audio.playbackCount(); deviceIndex += 1) {
+        const ma_device_info& info = audio.playbackInfo(deviceIndex);
+        std::cout << deviceIndex << " - " << info.name
+                  << (info.isDefault ? " (default)" : "") << "\n";
     }
 }
 
 void enumerateNetworkInterfaces() {
     const auto all = net::enumerate();
     std::cout << "interfaces:\n";
-    for (const auto &i : all)
-    {
-        std::cout << "  " << i.name << "  " << i.address.to_string()
-                  << "  idx=" << i.index;
-        if (!i.description.empty())
+    for (const auto &i : all) {
+        std::cout << "  " << i.name << "  " << i.address.to_string() << "  idx=" << i.index;
+        if (!i.description.empty()) {
             std::cout << "  (" << i.description << ")";
+        }
         std::cout << "\n";
     }
 }
