@@ -239,17 +239,16 @@ int main(int argc, char** argv) {
                           << std::setprecision(4) << filter.rate() << '\n';
             });
     };
-    arm();
-    std::thread worker([&]{ io.run(); });
 
     if (ma_device_start(&device) != MA_SUCCESS) {
         std::cerr << "Failed to start the playback device\n";
         ma_device_uninit(&device);
         ma_context_uninit(&context);
-        asio::post(io, [&]{ rx.close(); });
-        worker.join();
         return 2;
     }
+
+    arm();
+    std::thread worker([&]{ io.run(); });
 
     std::cin.get();
 
