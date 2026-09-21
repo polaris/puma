@@ -6,6 +6,7 @@ add_executable(puma_tests
     test_packet_ring.cpp
     test_time_filter.cpp
     test_servo_additions.cpp
+    test_frame_ring.cpp
 )
 
 # The Conan toolchain pins CMAKE_CXX_STANDARD to 14; the code under test needs 20.

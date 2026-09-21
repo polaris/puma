@@ -99,11 +99,11 @@ int main(int argc, char** argv) {
     std::cout << "Receiver configured\n";
 
     AudioPlayer::Config playerConfig;
-    playerConfig.format             = ma_format_s16;
-    playerConfig.channels           = 0;     // native
-    playerConfig.sampleRate         = senderSampleRate;
+    playerConfig.format = ma_format_s16;
+    playerConfig.channels = 0;     // native
+    playerConfig.sampleRate = senderSampleRate;
     playerConfig.periodSizeInFrames = periodSizeInFrames;
-    playerConfig.periods            = kNumPeriods;
+    playerConfig.periods = kNumPeriods;
 
     // No data callback yet: the received packets still go straight to the WAV
     // file, so the device plays silence. Feeding it is what the resampler in
