@@ -1,6 +1,8 @@
 
 #include <asio.hpp>
+#include <atomic>
 #include <chrono>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <thread>
@@ -15,6 +17,7 @@
 #include "audio_player.h"
 #include "netint.h"
 #include "time_filter.h"
+#include "frame_ring.h"
 
 using asio::ip::udp;
 using Clock = std::chrono::steady_clock;
@@ -25,9 +28,29 @@ constexpr unsigned short kDefaultMulticastPort = 12345;
 constexpr unsigned int kDefaultSampleRate = 48000;
 constexpr unsigned int kPeriodSizeInFrames = 240;
 constexpr unsigned int kNumPeriods = 3;
+constexpr std::size_t kHeaderBytes = 16;        // seq(4) + frames(4) + timestamp(8)
+
+constexpr std::size_t kRingFrames = 2048;
+using Ring = FrameRing<kRingFrames>;
 
 void enumerateNetworkInterfaces();
 void enumerateOutputDevices(const AudioContext& audio);
+
+struct PlaybackState {
+    std::chrono::steady_clock::time_point origin;
+    bool configured = false;
+    TimeFilter timeFilter{};
+    unsigned int sampleRate = 0;
+    unsigned int periodSizeInSamples = 0;
+
+    // Filled in after the device is open and before it is started, because the
+    // audio thread reads them and does not exist until start().
+    Ring* ring = nullptr;
+    std::size_t bytesPerFrame = 0;
+
+    // Written on the audio thread, read on shutdown.
+    std::atomic<std::uint64_t> underrunFrames{0};
+};
 
 int main(int argc, char** argv) {
     CLI::App app{"Receiver"};
@@ -105,11 +128,40 @@ int main(int argc, char** argv) {
     playerConfig.periodSizeInFrames = periodSizeInFrames;
     playerConfig.periods = kNumPeriods;
 
-    // No data callback yet: the received packets still go straight to the WAV
-    // file, so the device plays silence. Feeding it is what the resampler in
-    // front of this will do.
+    Ring frameRing;
+
+    const auto origin  = Clock::now();
+
+    PlaybackState state{
+        .origin = origin,
+        .sampleRate = senderSampleRate,
+        .periodSizeInSamples = periodSizeInFrames,
+    };
+
     AudioPlayer player;
-    if (!player.open(audio, audio.playbackInfo(outputDeviceIndex).id, playerConfig)) {
+    if (!player.open(audio, audio.playbackInfo(outputDeviceIndex).id, playerConfig, 
+        [](void* user, void* output, ma_uint32 frameCount) {
+            const auto call = Clock::now();
+            auto* const s = static_cast<PlaybackState*>(user);
+            const auto t = std::chrono::duration<double>(call - s->origin).count();
+            if (!s->configured) {
+                s->timeFilter.configure(kBandwidth, s->periodSizeInSamples, s->sampleRate);
+                s->timeFilter.reset(t);
+                s->configured = true;
+            } else {
+                s->timeFilter.update(t);
+            }
+
+            // The buffer has to be filled on every call, including the first:
+            // returning early would hand the device whatever was in it.
+            auto* const out = static_cast<std::uint8_t*>(output);
+            const std::size_t got = s->ring->read(out, frameCount);
+            if (got < frameCount) {
+                const std::size_t short_ = frameCount - got;
+                std::memset(out + got * s->bytesPerFrame, 0, short_ * s->bytesPerFrame);
+                s->underrunFrames.fetch_add(short_, std::memory_order_relaxed);
+            }
+        }, &state)) {
         std::cerr << "Failed to open the selected output device\n";
         return 2;
     }
@@ -120,7 +172,15 @@ int main(int argc, char** argv) {
     }
     std::cout << "playback: " << player.channels() << " ch s16 @ " << player.sampleRate() << " Hz\n";
 
-    const auto origin  = Clock::now();
+    // Everything the audio callback touches has to be in place before start().
+    const std::size_t bytesPerFrame = player.bytesPerFrame();
+    if (!frameRing.init(bytesPerFrame)) {
+        std::cerr << "Unsupported frame size: " << bytesPerFrame << " bytes\n";
+        return 2;
+    }
+    state.ring = &frameRing;
+    state.bytesPerFrame = bytesPerFrame;
+
     const auto seconds = [origin](Clock::time_point tp) {
         return std::chrono::duration<double>(tp - origin).count();
     };
@@ -132,7 +192,25 @@ int main(int argc, char** argv) {
 
     std::uint32_t expectedSeq = 0;
     std::uint64_t discontinuities = 0;
+    std::uint64_t ringDrops = 0;        // packets the ring had no room for
+    std::uint64_t lostFrames = 0;       // frames the sender sent that never arrived
+    std::uint64_t concealFailures = 0;  // holes the ring was too full to patch
+    std::uint64_t resyncs = 0;          // holes too large to patch at all
+    std::uint64_t sizeMismatches = 0;   // payloads that are not frames * bytesPerFrame
     bool stopping = false;      // io thread only, set by the teardown below
+
+    const auto insertSilence = [&](std::size_t missing) {
+        const Regions regions = frameRing.acquireWrite(missing);
+        if (regions.frames() < missing) {
+            return false;
+        }
+        for (const Region* part : {&regions.region1(), &regions.region2()}) {
+            if (part->len > 0) {
+                std::memset(part->buf, 0, part->len * bytesPerFrame);
+            }
+        }
+        return frameRing.commitWrite(missing);
+    };
 
     std::function<void()> arm = [&] {
         rx.async_receive(asio::buffer(buf),
@@ -169,20 +247,36 @@ int main(int argc, char** argv) {
                 std::uint64_t ts;
                 std::memcpy(&ts, buf.data() + 8, 8);
 
-                const std::array<std::uint8_t, 8192> payload = [&] {
-                    std::array<std::uint8_t, 8192> out{};
-                    std::memcpy(out.data(), buf.data() + 16, n - 16);
-                    return out;
-                }();
-
                 arm();
 
                 const std::uint32_t gap = seq - expectedSeq;   // unsigned, wrap-safe
                 if (gap != 0) {
                     ++discontinuities;
-                    filter.skip(gap);
+                    const std::size_t missing = static_cast<std::size_t>(gap) * frames;
+
+                    if (missing > kRingFrames) {
+                        ++resyncs;
+                        filter.invalidate();
+                    } else {
+                        lostFrames += missing;
+                        filter.skip(gap);
+                        if (!insertSilence(missing)) {
+                            ++concealFailures;
+                        }
+                    }
                 }
                 expectedSeq = seq + 1;
+
+                if (n - kHeaderBytes != frames * bytesPerFrame) {
+                    if (sizeMismatches == 0) {
+                        std::cerr << "payload is " << (n - kHeaderBytes) << " bytes for "
+                                  << frames << " frames, but this device wants "
+                                  << bytesPerFrame << " bytes per frame\n";
+                    }
+                    ++sizeMismatches;
+                } else if (!frameRing.write(buf.data() + kHeaderBytes, frames)) {
+                    ++ringDrops;                // whole packet or nothing
+                }
 
                 const double t = seconds(arrival);
 
@@ -245,6 +339,15 @@ int main(int argc, char** argv) {
         rx.close(ignored);
     });
     worker.join();
+
+    std::cerr << "discontinuities " << discontinuities
+              << ", lost frames " << lostFrames
+              << ", conceal failures " << concealFailures
+              << ", resyncs " << resyncs
+              << ", ring drops " << ringDrops
+              << ", size mismatches " << sizeMismatches
+              << ", underrun frames " << state.underrunFrames.load()
+              << "\n";
 
     return 0;
 }
