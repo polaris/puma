@@ -40,7 +40,7 @@ class FrameRing {
     static_assert(CapacityFrames >= 2 && (CapacityFrames & (CapacityFrames - 1)) == 0,
                   "CapacityFrames must be a power of two");
     static constexpr std::size_t kMask = CapacityFrames - 1;
-    static constexpr std::size_t kMinFrameBytes = 2;   // 1 ch * s16
+    static constexpr std::size_t kMinFrameBytes = 2;    // 1 ch * s16
     static constexpr std::size_t kMaxFrameBytes = 16;   // 8 ch * s16
 
 public:
@@ -117,14 +117,6 @@ public:
         return true;
     }
 
-    // Copies `frames` frames in, or nothing at all, and returns whether it fit.
-    //
-    // All-or-nothing because a torn packet is worse than a dropped one: the
-    // consumer would play the fragment and continue straight into the next
-    // packet, with the missing frames gone and nothing recording that they
-    // were. A refusal is one countable event at a packet boundary, which is
-    // what the sender already does when its own ring is full. Nothing is
-    // published on refusal, because acquireWrite does not move the counter.
     [[nodiscard]] bool write(const void* src, std::size_t frames) {
         const Regions regions = acquireWrite(frames);
         if (regions.frames() < frames) {
@@ -139,13 +131,6 @@ public:
         return commitWrite(frames);
     }
 
-    // Copies up to `frames` frames out and returns how many it got.
-    //
-    // Clamps rather than refusing, which is the opposite of write() on purpose:
-    // the audio callback has to produce a full period whatever happens, so
-    // taking what is there beats taking nothing. The shortfall is the caller's
-    // to pad with silence and to count. Frames beyond the returned count are
-    // left untouched, not zeroed.
     [[nodiscard]] std::size_t read(void* dst, std::size_t frames) {
         const Regions regions = acquireRead(frames);
 
@@ -160,7 +145,7 @@ public:
     }
 
 private:
-    std::size_t bytesPerFrame_ = 0;         // runtime; frames are the unit everywhere else
+    std::size_t bytesPerFrame_ = 0;
     alignas(128) std::atomic<std::size_t> write_{0};
     alignas(128) std::atomic<std::size_t> read_{0};
     alignas(128) std::array<std::uint8_t, CapacityFrames * kMaxFrameBytes> buffer_{};
