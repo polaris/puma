@@ -1,10 +1,15 @@
 #include <asio.hpp>
 
-#include "netint.h"
-#include "packet_ring.h"
-
+// audio_recorder.h pulls in the miniaudio declarations; the implementation
+// block sits outside that header's include guard, so this has to be compiled
+// here.
 #define MA_IMPLEMENTATION
 #include <miniaudio.h>
+
+#include "audio_context.h"
+#include "audio_recorder.h"
+#include "netint.h"
+#include "packet_ring.h"
 
 #include <array>
 #include <atomic>
@@ -22,6 +27,9 @@ using Clock = std::chrono::steady_clock;
 using asio::ip::udp;
 
 constexpr std::size_t kHeaderBytes = 16;    // seq(4) + frames(4) + timestamp(8)
+constexpr ma_uint32   kPeriodSizeInFrames = 240;
+constexpr ma_uint32   kNumPeriods = 3;
+constexpr ma_uint32   kCaptureDeviceIndex = 0;      // no option for this yet
 
 struct SenderContext {
     PacketRing ring;
@@ -34,9 +42,8 @@ struct SenderContext {
     std::size_t bytesPerFrame = 0;
 };
 
-void data_callback(ma_device* device, void* output, const void* input, ma_uint32 frameCount) {
-    (void)output;
-    auto* ctx = static_cast<SenderContext*>(device->pUserData);
+void data_callback(void* user, const void* input, ma_uint32 frameCount) {
+    auto* ctx = static_cast<SenderContext*>(user);
  
     const std::size_t payload = kHeaderBytes + frameCount * ctx->bytesPerFrame;
     if (payload > kMaxPayload) {
@@ -88,28 +95,54 @@ int main(int argc, char** argv) {
     net::configureSender(tx, group, *chosen, {.hops = 1, .loopback = true});
     std::cout << "Sender configured\n";
 
-    SenderContext ctx;
-    ctx.origin = Clock::now();
- 
-    ma_device_config config    = ma_device_config_init(ma_device_type_capture);
-    config.capture.format      = ma_format_s16;
-    config.capture.channels    = 0;
-    config.sampleRate          = 0;
-    config.periodSizeInFrames  = 240;
-    config.periods             = 3;
-    config.performanceProfile  = ma_performance_profile_low_latency;
-    config.pUserData           = &ctx;
-    config.dataCallback        = data_callback;
- 
-    ma_device device;
-    if (ma_device_init(nullptr, &config, &device) != MA_SUCCESS) {
+    AudioContext audio;
+    if (!audio.init()) {
+        std::cerr << "Failed to initialise the audio context\n";
         return 2;
     }
- 
-    ctx.bytesPerFrame = ma_get_bytes_per_frame(device.capture.format, device.capture.channels);
-    if (kHeaderBytes + 240 * ctx.bytesPerFrame > kMaxPayload) {
+    if (audio.captureCount() == 0) {
+        std::cerr << "No audio capture devices available\n";
+        return 2;
+    }
+    for (ma_uint32 deviceIndex = 0; deviceIndex < audio.captureCount(); deviceIndex += 1) {
+        const ma_device_info& info = audio.captureInfo(deviceIndex);
+        std::cout << deviceIndex << " - " << info.name
+                  << (info.isDefault ? " (default)" : "") << "\n";
+    }
+
+    SenderContext ctx;
+    ctx.origin = Clock::now();
+
+    AudioRecorder::Config recorderConfig;
+    recorderConfig.format             = ma_format_s16;
+    recorderConfig.channels           = 0;      // native
+    recorderConfig.sampleRate         = 0;      // native: the sender defines the rate
+    recorderConfig.periodSizeInFrames = kPeriodSizeInFrames;
+    recorderConfig.periods            = kNumPeriods;
+
+    AudioRecorder recorder;
+    if (!recorder.open(audio, audio.captureInfo(kCaptureDeviceIndex).id, recorderConfig,
+                       data_callback, &ctx)) {
+        std::cerr << "Failed to open the capture device\n";
+        return 2;
+    }
+
+    // Asking for the native rate should get it untouched. If it did not, a
+    // resampler sits between the ADC and the callback, and the timestamps the
+    // receiver recovers its clock from would describe the resampler, not the
+    // capture hardware.
+    if (recorder.sampleRate() != recorder.internalSampleRate()) {
+        std::cerr << "Capture device runs at " << recorder.internalSampleRate()
+                  << " Hz but delivers " << recorder.sampleRate() << " Hz\n";
+        return 2;
+    }
+    std::cout << "capture: " << recorder.channels() << " ch s16 @ " << recorder.sampleRate()
+              << " Hz (run the receiver with -s " << recorder.sampleRate() << ")\n";
+
+    // The callback reads bytesPerFrame, so it has to be set before start().
+    ctx.bytesPerFrame = recorder.bytesPerFrame();
+    if (kHeaderBytes + kPeriodSizeInFrames * ctx.bytesPerFrame > kMaxPayload) {
         std::cerr << "payload too large for slot\n";
-        ma_device_uninit(&device);
         return 3;
     }
 
@@ -133,14 +166,20 @@ int main(int argc, char** argv) {
         }
     });
  
-    if (ma_device_start(&device) != MA_SUCCESS) {
-        ma_device_uninit(&device);
+    // Unlike the receiver, the worker has to exist before the device starts:
+    // it is the consumer the callback hands slots to, so starting first would
+    // drop the opening packets. That is what makes this failure path join.
+    if (!recorder.start()) {
+        std::cerr << "Failed to start the capture device\n";
+        ctx.running.store(false);
+        ctx.wake.release();
+        worker.join();
         return 4;
     }
     std::cin.get();
- 
-    ma_device_stop(&device);
-    ma_device_uninit(&device);
+
+    // Producer first, then the consumer it feeds.
+    recorder.stop();
     ctx.running.store(false);
     ctx.wake.release();
     worker.join();
