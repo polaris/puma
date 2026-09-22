@@ -4,7 +4,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <deque>
 #include <memory>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -447,9 +450,16 @@ TEST_CASE("a producer and a consumer thread see every byte in order", "[frame_ri
     int got = 0;
     int want = 0;
 
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    bool stalled = false;
+
     while (framesRead < kTotalFrames && matched) {
         const std::size_t frames = ring->read(out.data(), kReadChunk);
         if (frames == 0) {
+            if (std::chrono::steady_clock::now() > deadline) {
+                stalled = true;
+                break;
+            }
             std::this_thread::yield();
             continue;
         }
@@ -471,9 +481,130 @@ TEST_CASE("a producer and a consumer thread see every byte in order", "[frame_ri
     producer.join();
 
     INFO("first mismatch at stream byte " << badAt << ": got " << got << ", want " << want);
+    REQUIRE_FALSE(stalled);
     REQUIRE(matched);
     REQUIRE(framesRead == kTotalFrames);
     REQUIRE(ring->availableRead() == 0);
+}
+
+
+TEST_CASE("randomised operations agree with a reference FIFO", "[frame_ring]") {
+    constexpr std::size_t kSteps = 20000;
+    constexpr std::size_t kFrameSizes[] = {2, 4, 6};
+    constexpr unsigned kSeeds[] = {1, 2, 3};
+
+    for (const std::size_t bytesPerFrame : kFrameSizes) {
+        for (const unsigned seed : kSeeds) {
+            CAPTURE(bytesPerFrame, seed);
+
+            auto ring = makeRing();
+            REQUIRE(ring->init(bytesPerFrame));
+
+            std::deque<std::uint8_t> model;        // the bytes the ring should hold
+            std::mt19937 rng{seed};
+            std::size_t writePos = 0; // stream position of the next byte written
+            std::vector<std::uint8_t> scratch((kCapacity + 2) * bytesPerFrame);
+
+            const char* failure  = nullptr;
+            std::size_t failedAt = 0;
+            auto fail = [&](std::size_t step, const char* what) {
+                if (failure == nullptr) { failedAt = step; failure = what; }
+            };
+
+            for (std::size_t step = 0; step < kSteps && failure == nullptr; ++step) {
+                const std::size_t op = rng() % 4;
+                const std::size_t asked = rng() % (kCapacity + 2);   // sometimes too many
+                const std::size_t held = model.size() / bytesPerFrame;
+
+                if (op == 0) {                                        // write(src, n)
+                    for (std::size_t i = 0; i < asked * bytesPerFrame; ++i) {
+                        scratch[i] = patternByte(writePos + i);
+                    }
+                    const bool fits = asked <= kCapacity - held;
+                    if (ring->write(scratch.data(), asked) != fits) {
+                        fail(step, "write() returned the wrong verdict");
+                    } else if (fits) {
+                        model.insert(model.end(), scratch.begin(),
+                                     scratch.begin()
+                                         + static_cast<std::ptrdiff_t>(asked * bytesPerFrame));
+                        writePos += asked * bytesPerFrame;
+                    }
+                } else if (op == 1) {                                 // read(dst, n)
+                    const std::size_t got = ring->read(scratch.data(), asked);
+                    if (got != std::min(asked, held)) {
+                        fail(step, "read() returned the wrong frame count");
+                    } else {
+                        for (std::size_t i = 0; i < got * bytesPerFrame; ++i) {
+                            if (scratch[i] != model.front()) {
+                                fail(step, "read() returned the wrong bytes");
+                                break;
+                            }
+                            model.pop_front();
+                        }
+                    }
+                } else if (op == 2) {                                 // acquire, commit part
+                    const Regions regions = ring->acquireWrite(asked);
+                    if (regions.frames() != std::min(asked, kCapacity - held)) {
+                        fail(step, "acquireWrite offered the wrong frame count");
+                    } else {
+                        const Region* parts[] = {&regions.region1(), &regions.region2()};
+                        std::size_t filled = 0;
+                        for (const Region* part : parts) {
+                            for (std::size_t i = 0; i < part->len * bytesPerFrame; ++i) {
+                                part->buf[i] = patternByte(writePos + filled + i);
+                            }
+                            filled += part->len * bytesPerFrame;
+                        }
+                        const std::size_t commit =
+                            regions.frames() == 0 ? 0 : rng() % (regions.frames() + 1);
+                        if (!ring->commitWrite(commit)) {
+                            fail(step, "commitWrite refused a legal commit");
+                        } else {
+                            for (std::size_t i = 0; i < commit * bytesPerFrame; ++i) {
+                                model.push_back(patternByte(writePos + i));
+                            }
+                            writePos += commit * bytesPerFrame;
+                        }
+                    }
+                } else {                                              // acquire, consume part
+                    const Regions regions = ring->acquireRead(asked);
+                    if (regions.frames() != std::min(asked, held)) {
+                        fail(step, "acquireRead offered the wrong frame count");
+                    } else {
+                        const Region* parts[] = {&regions.region1(), &regions.region2()};
+                        std::size_t checked = 0;
+                        for (const Region* part : parts) {
+                            for (std::size_t i = 0; i < part->len * bytesPerFrame; ++i) {
+                                if (part->buf[i] != model[checked + i]) {
+                                    fail(step, "acquireRead exposed the wrong bytes");
+                                    break;
+                                }
+                            }
+                            checked += part->len * bytesPerFrame;
+                        }
+                        if (failure == nullptr) {
+                            const std::size_t commit =
+                                regions.frames() == 0 ? 0 : rng() % (regions.frames() + 1);
+                            if (!ring->commitRead(commit)) {
+                                fail(step, "commitRead refused a legal commit");
+                            } else {
+                                model.erase(model.begin(),
+                                            model.begin()
+                                                + static_cast<std::ptrdiff_t>(commit * bytesPerFrame));
+                            }
+                        }
+                    }
+                }
+
+                if (failure == nullptr && ring->availableRead() != model.size() / bytesPerFrame) {
+                    fail(step, "availableRead disagrees with the model");
+                }
+            }
+
+            INFO("failed at step " << failedAt << ": " << (failure != nullptr ? failure : ""));
+            REQUIRE(failure == nullptr);
+        }
+    }
 }
 
 }

@@ -15,6 +15,7 @@ endif()
 
 option(PUMA_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(PUMA_NATIVE_ARCH "Optimize release builds for the host CPU (binaries are not portable)" OFF)
+option(PUMA_SANITIZE_THREAD "Build with ThreadSanitizer (development only, needs its own build dir)" OFF)
 
 if(MSVC)
     # C4324: structure padded due to alignment specifier. That padding is the point
@@ -35,11 +36,20 @@ elseif(PUMA_NATIVE_ARCH)
     add_compile_options($<$<CONFIG:Release>:-march=native>)
 endif()
 
-# Link-time optimization for release builds when the toolchain supports it.
+if(PUMA_SANITIZE_THREAD)
+    if(MSVC)
+        message(FATAL_ERROR "PUMA_SANITIZE_THREAD is not supported with MSVC")
+    endif()
+    add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=thread)
+endif()
+
 include(CheckIPOSupported)
 check_ipo_supported(RESULT PUMA_IPO_SUPPORTED OUTPUT PUMA_IPO_OUTPUT LANGUAGES CXX)
-if(PUMA_IPO_SUPPORTED)
+if(PUMA_IPO_SUPPORTED AND NOT PUMA_SANITIZE_THREAD)
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+elseif(PUMA_IPO_SUPPORTED)
+    message(STATUS "IPO/LTO disabled because PUMA_SANITIZE_THREAD is on")
 else()
     message(STATUS "IPO/LTO not supported: ${PUMA_IPO_OUTPUT}")
 endif()

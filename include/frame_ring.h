@@ -8,6 +8,26 @@
 #include <cstdint>
 #include <cstring>
 
+#ifndef FRAME_RING_CHECKS
+  #ifdef NDEBUG
+    #define FRAME_RING_CHECKS 0
+  #else
+    #define FRAME_RING_CHECKS 1
+  #endif
+#endif
+
+#if FRAME_RING_CHECKS
+  #include <cstdio>
+  #include <cstdlib>
+  #define FRAME_RING_ASSERT(cond)                                                  \
+      ((cond) ? static_cast<void>(0)                                               \
+              : (std::fprintf(stderr, "FrameRing invariant failed: %s at %s:%d\n", \
+                              #cond, __FILE__, __LINE__),                          \
+                 std::abort()))
+#else
+  #define FRAME_RING_ASSERT(cond) static_cast<void>(0)
+#endif
+
 struct Region {
     std::uint8_t *buf = nullptr;
     std::size_t len = 0;
@@ -35,6 +55,7 @@ private:
     Region region1_, region2_;
 };
 
+// Single consumer, single producer ring buffer for audio frames (1-8ch, 16bit PCM).
 template <std::size_t CapacityFrames>
 class FrameRing {
     static_assert(CapacityFrames >= 2 && (CapacityFrames & (CapacityFrames - 1)) == 0,
@@ -72,6 +93,7 @@ public:
     }
 
     [[nodiscard]] Regions acquireWrite(std::size_t requested) {
+        checkState();
         const std::size_t w = write_.load(std::memory_order_relaxed);
         const std::size_t r = read_.load(std::memory_order_acquire);
         const std::size_t available = CapacityFrames - (w - r);
@@ -79,6 +101,7 @@ public:
         const std::size_t n = std::min(requested, available);
         const std::size_t len1 = std::min(n, CapacityFrames - offset);
         const std::size_t len2 = n - len1;
+        checkSplit(requested, n, len1, len2, offset);
         return Regions{{ len1 > 0 ? frameAt(w)     : nullptr, len1 },
                        { len2 > 0 ? buffer_.data() : nullptr, len2 }};
     }
@@ -91,10 +114,12 @@ public:
             return false;
         }
         write_.store(w + written, std::memory_order_release);
+        checkState();
         return true;
     }
 
     [[nodiscard]] Regions acquireRead(std::size_t requested) {
+        checkState();
         const std::size_t r = read_.load(std::memory_order_relaxed);
         const std::size_t w = write_.load(std::memory_order_acquire);
         const std::size_t available = w - r;
@@ -102,6 +127,7 @@ public:
         const std::size_t n = std::min(requested, available);
         const std::size_t len1 = std::min(n, CapacityFrames - offset);
         const std::size_t len2 = n - len1;
+        checkSplit(requested, n, len1, len2, offset);
         return Regions{{ len1 > 0 ? frameAt(r)     : nullptr, len1 },
                        { len2 > 0 ? buffer_.data() : nullptr, len2 }};
     }
@@ -114,6 +140,7 @@ public:
             return false;
         }
         read_.store(r + read, std::memory_order_release);
+        checkState();
         return true;
     }
 
@@ -153,6 +180,27 @@ private:
     [[nodiscard]] std::uint8_t* frameAt(std::size_t counter) noexcept {
         return buffer_.data() + (counter & kMask) * bytesPerFrame_;
     }
+
+#if FRAME_RING_CHECKS
+    void checkState() const noexcept {
+        const std::size_t w = write_.load(std::memory_order_relaxed);
+        const std::size_t r = read_.load(std::memory_order_relaxed);
+        FRAME_RING_ASSERT(w - r <= CapacityFrames);
+        FRAME_RING_ASSERT(bytesPerFrame_ != 0);
+    }
+
+    void checkSplit(std::size_t requested, std::size_t n, std::size_t len1, std::size_t len2, std::size_t offset) const noexcept {
+        FRAME_RING_ASSERT(offset < CapacityFrames);
+        FRAME_RING_ASSERT(n <= requested);
+        FRAME_RING_ASSERT(n <= CapacityFrames);
+        FRAME_RING_ASSERT(len1 + len2 == n);
+        FRAME_RING_ASSERT(offset + len1 <= CapacityFrames);
+        FRAME_RING_ASSERT(len2 <= offset);
+    }
+#else
+    void checkState() const noexcept {}
+    void checkSplit(std::size_t, std::size_t, std::size_t, std::size_t, std::size_t) const noexcept {}
+#endif
 };
 
 #endif  // FRAME_RING_H
