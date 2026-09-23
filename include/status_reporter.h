@@ -52,6 +52,7 @@ private:
     void showStatus(std::string line);
 
     asio::steady_timer timer_;
+    Clock::time_point next_;
     const SnapshotSource takeSnapshot_;
     const ReceiveStats& stats_;
     const PlaybackStats& playback_;
