@@ -6,6 +6,8 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <optional>
+#include <string>
 #include <thread>
 #include <CLI/CLI.hpp>
 
@@ -33,9 +35,6 @@ constexpr std::size_t kHeaderBytes = 16;        // seq(4) + frames(4) + timestam
 
 constexpr std::size_t kRingFrames = 2048;
 using Ring = FrameRing<kRingFrames>;
-
-void enumerateNetworkInterfaces();
-void enumerateOutputDevices(const AudioContext& audio);
 
 struct ReceiveStats {
     std::uint64_t discontinuities = 0;
@@ -269,145 +268,14 @@ private:
     std::array<std::uint8_t, 8192> buf_;    // last, so the hot members share cache lines
 };
 
-int main(int argc, char** argv) {
-    CLI::App app{"Receiver"};
-    argv = app.ensure_utf8(argv);
-
-    AudioContext audio;
-    if (!audio.init()) {
-        std::cerr << "Failed to initialise the audio context\n";
-        return 2;
-    }
-    if (audio.playbackCount() == 0) {
-        std::cerr << "No audio playback devices available\n";
-        return 2;
-    }
-
-    app.add_flag("--enumOutputDevices",
-        [&audio] (int64_t) {
-            enumerateOutputDevices(audio);
-            throw CLI::Success();
-        }, "Enumerate audio output devices")
-        ->trigger_on_parse();
-    app.add_flag("--enumNetworkInterfaces",
-        [] (int64_t) {
-            enumerateNetworkInterfaces();
-            throw CLI::Success();
-        }, "Enumerate network interfaces")
-        ->trigger_on_parse();
-
+struct Options {
     unsigned int outputDeviceIndex = 0;
-    app.add_option("-o,--outputDeviceIndex", outputDeviceIndex, "Index of the audio output device")
-        ->required();
-    
     unsigned int senderSampleRate = kDefaultSampleRate;
-    app.add_option("-s,--senderSampleRate", senderSampleRate, "Sender sample rate")
-        ->check(CLI::PositiveNumber);
-
     unsigned int periodSizeInFrames = kPeriodSizeInFrames;
-    app.add_option("-f,--periodSizeInFrames", periodSizeInFrames, "Period size in frames")
-        ->check(CLI::PositiveNumber);
-
     std::string networkInterface;
-    app.add_option("-n,--networkInterface", networkInterface, "Network interface");
-
     std::string multicastGroup{kDefaultMulticastGroup};
-    app.add_option("-m,--multicastGroup", multicastGroup, "Multicast group address")
-        ->check(CLI::ValidIPV4);
-    
     unsigned short multicastPort = kDefaultMulticastPort;
-    app.add_option("-p,--multicastPort", multicastPort, "Multicast port");
-    
-    CLI11_PARSE(app, argc, argv);
-
-    if (outputDeviceIndex >= audio.playbackCount()) {
-        std::cerr << "Output device with index " << outputDeviceIndex << " not available\n";
-        return 2;
-    }
-
-    const auto chosen = !networkInterface.empty() ? net::find(networkInterface) : net::selectDefault();
-    if (!chosen) {
-        std::cerr << (!networkInterface.empty() ? "No such interface\n" : "Ambiguous or none; name one explicitly\n");
-        return 1;
-    }
-    std::cout << "Using network interface " << chosen->name << " " << chosen->address.to_string() << "\n";
-
-    const asio::ip::udp::endpoint group(asio::ip::make_address(multicastGroup), multicastPort);
-    asio::io_context io;
-    asio::ip::udp::socket rx(io);
-    net::configureReceiver(rx, group, *chosen);
-    std::cout << "Receiver configured\n";
-
-    AudioPlayer::Config playerConfig {
-        .format = ma_format_s16,
-        .channels = 0,     // native
-        .sampleRate = senderSampleRate,
-        .periodSizeInFrames = periodSizeInFrames,
-        .periods = kNumPeriods,
-    };
-
-    Ring frameRing;
-    ReceiveStats stats;
-
-    const auto origin  = Clock::now();
-
-    PlaybackState state{
-        .origin = origin,
-        .sampleRate = senderSampleRate,
-        .periodSizeInSamples = periodSizeInFrames,
-        .stats = &stats,
-    };
-
-    AudioPlayer player;
-    if (!player.open(audio, audio.playbackInfo(outputDeviceIndex).id, playerConfig, onPlayback, &state)) {
-        std::cerr << "Failed to open the selected output device\n";
-        return 2;
-    }
-    if (player.internalSampleRate() != senderSampleRate) {
-        std::cerr << "Output device runs at " << player.internalSampleRate()
-                  << " Hz, but the sender uses " << senderSampleRate << " Hz\n";
-        return 2;
-    }
-    std::cout << "playback: " << player.channels() << " ch s16 @ " << player.sampleRate() << " Hz\n";
-
-    // Everything the audio callback touches has to be in place before start().
-    const std::size_t bytesPerFrame = player.bytesPerFrame();
-    if (!frameRing.init(bytesPerFrame)) {
-        std::cerr << "Unsupported frame size: " << bytesPerFrame << " bytes\n";
-        return 2;
-    }
-    state.ring = &frameRing;
-    state.bytesPerFrame = bytesPerFrame;
-
-    PacketReceiver receiver(rx, frameRing, stats, bytesPerFrame, senderSampleRate, origin);
-
-    if (!player.start()) {
-        std::cerr << "Failed to start the playback device\n";
-        return 2;
-    }
-
-    receiver.start();
-    std::thread worker([&]{ io.run(); });
-
-    asio::io_context wait;
-    asio::signal_set signals{wait, SIGINT, SIGTERM};
-    signals.async_wait([&](auto, int) {
-        std::cerr << "\nshutting down\n";
-        wait.stop();
-    });
-
-    wait.run();
-
-    player.stop();
-
-    // Close from inside the io thread.
-    asio::post(io, [&receiver]{ receiver.stop(); });
-    worker.join();
-
-    printReceiveStats(stats);
-
-    return 0;
-}
+};
 
 void enumerateOutputDevices(const AudioContext& audio) {
     for (ma_uint32 deviceIndex = 0; deviceIndex < audio.playbackCount(); deviceIndex += 1) {
@@ -427,4 +295,159 @@ void enumerateNetworkInterfaces() {
         }
         std::cout << "\n";
     }
+}
+
+// Returns an exit code if the program should end here (--help, enumeration,
+// bad input), nothing if it should go on.
+std::optional<int> parseOptions(int argc, char** argv, const AudioContext& audio, Options& opts) {
+    CLI::App app{"Receiver"};
+    argv = app.ensure_utf8(argv);
+
+    app.add_flag("--enumOutputDevices",
+        [&audio] (int64_t) {
+            enumerateOutputDevices(audio);
+            throw CLI::Success();
+        }, "Enumerate audio output devices")
+        ->trigger_on_parse();
+    app.add_flag("--enumNetworkInterfaces",
+        [] (int64_t) {
+            enumerateNetworkInterfaces();
+            throw CLI::Success();
+        }, "Enumerate network interfaces")
+        ->trigger_on_parse();
+
+    app.add_option("-o,--outputDeviceIndex", opts.outputDeviceIndex, "Index of the audio output device")
+        ->required();
+    app.add_option("-s,--senderSampleRate", opts.senderSampleRate, "Sender sample rate")
+        ->check(CLI::PositiveNumber);
+    app.add_option("-f,--periodSizeInFrames", opts.periodSizeInFrames, "Period size in frames")
+        ->check(CLI::PositiveNumber);
+    app.add_option("-n,--networkInterface", opts.networkInterface, "Network interface");
+    app.add_option("-m,--multicastGroup", opts.multicastGroup, "Multicast group address")
+        ->check(CLI::ValidIPV4);
+    app.add_option("-p,--multicastPort", opts.multicastPort, "Multicast port");
+
+    // What CLI11_PARSE expands to; CLI::Success from the flags above lands here too.
+    try {
+        app.parse(argc, argv);
+    } catch (const CLI::ParseError& e) {
+        return app.exit(e);
+    }
+    return std::nullopt;
+}
+
+bool openSocket(udp::socket& rx, const Options& opts) {
+    const auto chosen = !opts.networkInterface.empty() ? net::find(opts.networkInterface) : net::selectDefault();
+    if (!chosen) {
+        std::cerr << (!opts.networkInterface.empty() ? "No such interface\n" : "Ambiguous or none; name one explicitly\n");
+        return false;
+    }
+    std::cout << "Using network interface " << chosen->name << " " << chosen->address.to_string() << "\n";
+
+    const udp::endpoint group(asio::ip::make_address(opts.multicastGroup), opts.multicastPort);
+    net::configureReceiver(rx, group, *chosen);
+    std::cout << "Receiver configured\n";
+    return true;
+}
+
+// Blocks until SIGINT or SIGTERM.
+void waitForShutdownSignal() {
+    asio::io_context wait;
+    asio::signal_set signals{wait, SIGINT, SIGTERM};
+    signals.async_wait([&](auto, int) {
+        std::cerr << "\nshutting down\n";
+        wait.stop();
+    });
+    wait.run();
+}
+
+int main(int argc, char** argv) {
+    AudioContext audio;
+    if (!audio.init()) {
+        std::cerr << "Failed to initialise the audio context\n";
+        return 2;
+    }
+    if (audio.playbackCount() == 0) {
+        std::cerr << "No audio playback devices available\n";
+        return 2;
+    }
+
+    Options opts;
+    if (const auto exitCode = parseOptions(argc, argv, audio, opts)) {
+        return *exitCode;
+    }
+
+    if (opts.outputDeviceIndex >= audio.playbackCount()) {
+        std::cerr << "Output device with index " << opts.outputDeviceIndex << " not available\n";
+        return 2;
+    }
+
+    asio::io_context io;
+    udp::socket rx(io);
+    if (!openSocket(rx, opts)) {
+        return 1;
+    }
+
+    AudioPlayer::Config playerConfig {
+        .format = ma_format_s16,
+        .channels = 0,     // native
+        .sampleRate = opts.senderSampleRate,
+        .periodSizeInFrames = opts.periodSizeInFrames,
+        .periods = kNumPeriods,
+    };
+
+    Ring frameRing;
+    ReceiveStats stats;
+
+    const auto origin  = Clock::now();
+
+    PlaybackState state{
+        .origin = origin,
+        .sampleRate = opts.senderSampleRate,
+        .periodSizeInSamples = opts.periodSizeInFrames,
+        .stats = &stats,
+    };
+
+    AudioPlayer player;
+    if (!player.open(audio, audio.playbackInfo(opts.outputDeviceIndex).id, playerConfig, onPlayback, &state)) {
+        std::cerr << "Failed to open the selected output device\n";
+        return 2;
+    }
+    if (player.internalSampleRate() != opts.senderSampleRate) {
+        std::cerr << "Output device runs at " << player.internalSampleRate()
+                  << " Hz, but the sender uses " << opts.senderSampleRate << " Hz\n";
+        return 2;
+    }
+    std::cout << "playback: " << player.channels() << " ch s16 @ " << player.sampleRate() << " Hz\n";
+
+    // Everything the audio callback touches has to be in place before start().
+    const std::size_t bytesPerFrame = player.bytesPerFrame();
+    if (!frameRing.init(bytesPerFrame)) {
+        std::cerr << "Unsupported frame size: " << bytesPerFrame << " bytes\n";
+        return 2;
+    }
+    state.ring = &frameRing;
+    state.bytesPerFrame = bytesPerFrame;
+
+    PacketReceiver receiver(rx, frameRing, stats, bytesPerFrame, opts.senderSampleRate, origin);
+
+    if (!player.start()) {
+        std::cerr << "Failed to start the playback device\n";
+        return 2;
+    }
+
+    receiver.start();
+    std::thread worker([&]{ io.run(); });
+
+    waitForShutdownSignal();
+
+    player.stop();
+
+    // Close from inside the io thread.
+    asio::post(io, [&receiver]{ receiver.stop(); });
+    worker.join();
+
+    printReceiveStats(stats);
+
+    return 0;
 }
