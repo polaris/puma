@@ -313,6 +313,72 @@ TEST_CASE("write takes all the frames or none of them", "[frame_ring]") {
     REQUIRE(ring->availableWrite() == 0);
 }
 
+TEST_CASE("writeSilence zeroes both regions across the wrap", "[frame_ring]") {
+    constexpr std::size_t kBytesPerFrame = 4;
+    auto ring = makeRing();
+    REQUIRE(ring->init(kBytesPerFrame));
+
+    // Leave non-zero bytes everywhere so the zeros have to come from writeSilence.
+    constexpr std::uint8_t kStale = 0xEE;
+    const std::vector<std::uint8_t> stale(kCapacity * kBytesPerFrame, kStale);
+    REQUIRE(ring->write(stale.data(), kCapacity));
+    std::vector<std::uint8_t> drained(stale.size());
+    REQUIRE(ring->read(drained.data(), kCapacity) == kCapacity);
+
+    // Empty again; move both positions to offset 12 so 8 frames wrap as 4 + 4.
+    REQUIRE(ring->write(stale.data(), 12));
+    REQUIRE(ring->read(drained.data(), 12) == 12);
+
+    const Regions regions = ring->acquireWrite(8);
+    REQUIRE(regions.region1().len == 4);
+    REQUIRE(regions.region2().len == 4);
+
+    REQUIRE(ring->writeSilence(8));
+    REQUIRE(ring->availableRead() == 8);
+
+    std::vector<std::uint8_t> out(8 * kBytesPerFrame, kStale);
+    REQUIRE(ring->read(out.data(), 8) == 8);
+    REQUIRE(std::all_of(out.begin(), out.end(), [](std::uint8_t b) { return b == 0; }));
+    REQUIRE(ring->availableRead() == 0);
+}
+
+TEST_CASE("writeSilence takes all the frames or none of them", "[frame_ring]") {
+    constexpr std::size_t kBytesPerFrame = 2;
+    auto ring = makeRing();
+    REQUIRE(ring->init(kBytesPerFrame));
+
+    REQUIRE_FALSE(ring->writeSilence(kCapacity + 1));
+    REQUIRE(ring->availableRead() == 0);
+
+    const std::vector<std::uint8_t> ten = makePattern(10, kBytesPerFrame, 0);
+    REQUIRE(ring->write(ten.data(), 10));
+    REQUIRE_FALSE(ring->writeSilence(7));
+    REQUIRE(ring->availableRead() == 10);
+    REQUIRE(ring->writeSilence(6));
+    REQUIRE(ring->availableWrite() == 0);
+    REQUIRE(ring->writeSilence(0));
+}
+
+TEST_CASE("silence lands between the data around it", "[frame_ring]") {
+    constexpr std::size_t kBytesPerFrame = 4;
+    auto ring = makeRing();
+    REQUIRE(ring->init(kBytesPerFrame));
+
+    const std::vector<std::uint8_t> before = makePattern(3, kBytesPerFrame, 1);
+    const std::vector<std::uint8_t> after = makePattern(3, kBytesPerFrame, 1 + before.size());
+    REQUIRE(ring->write(before.data(), 3));
+    REQUIRE(ring->writeSilence(2));
+    REQUIRE(ring->write(after.data(), 3));
+
+    std::vector<std::uint8_t> out(8 * kBytesPerFrame);
+    REQUIRE(ring->read(out.data(), 8) == 8);
+
+    std::vector<std::uint8_t> expected = before;
+    expected.resize(expected.size() + 2 * kBytesPerFrame, 0);
+    expected.insert(expected.end(), after.begin(), after.end());
+    REQUIRE(out == expected);
+}
+
 TEST_CASE("read clamps to what is available and leaves the rest alone", "[frame_ring]") {
     constexpr std::size_t kBytesPerFrame = 2;
     auto ring = makeRing();

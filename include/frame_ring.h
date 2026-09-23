@@ -158,6 +158,20 @@ public:
         return commitWrite(frames);
     }
 
+    // Writes `frames` frames of silence, all or nothing.
+    [[nodiscard]] bool writeSilence(std::size_t frames) {
+        const Regions regions = acquireWrite(frames);
+        if (regions.frames() < frames) {
+            return false;
+        }
+
+        const std::size_t bytes1 = regions.region1().len * bytesPerFrame_;
+        const std::size_t bytes2 = regions.region2().len * bytesPerFrame_;
+        if (bytes1 > 0) std::memset(regions.region1().buf, 0, bytes1);
+        if (bytes2 > 0) std::memset(regions.region2().buf, 0, bytes2);
+        return commitWrite(frames);
+    }
+
     [[nodiscard]] std::size_t read(void* dst, std::size_t frames) {
         const Regions regions = acquireRead(frames);
 

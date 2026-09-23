@@ -188,22 +188,9 @@ private:
 
         stats_.lostFrames += missing;
         filter_.skip(gap);
-        if (!insertSilence(missing)) {
+        if (!ring_.writeSilence(missing)) {
             ++stats_.concealFailures;
         }
-    }
-
-    bool insertSilence(std::size_t missing) {
-        const Regions regions = ring_.acquireWrite(missing);
-        if (regions.frames() < missing) {
-            return false;
-        }
-        for (const Region* part : {&regions.region1(), &regions.region2()}) {
-            if (part->len > 0) {
-                std::memset(part->buf, 0, part->len * bytesPerFrame_);
-            }
-        }
-        return ring_.commitWrite(missing);
     }
 
     void storePayload(std::uint32_t frames, std::size_t payloadBytes) {
