@@ -6,14 +6,17 @@
 #include <iostream>
 #include <utility>
 
+#include <asio/post.hpp>
+
 #include "terminal.h"
 
-StatusReporter::StatusReporter(asio::io_context& io, SnapshotSource takeSnapshot, const ReceiveStats& stats,
+StatusReporter::StatusReporter(asio::io_context& control, asio::io_context& receiveIo, SnapshotSource takeSnapshot,
                                const PlaybackStats& playback, unsigned int nominalRate, std::size_t bytesPerFrame,
                                Clock::time_point origin)
-: timer_{io}
+: control_{control}
+, receiveIo_{receiveIo}
+, timer_{control}
 , takeSnapshot_{std::move(takeSnapshot)}
-, stats_{stats}
 , playback_{playback}
 , nominalRate_{nominalRate}
 , bytesPerFrame_{bytesPerFrame}
@@ -41,19 +44,31 @@ void StatusReporter::schedule() {
         if (stopping_ || ec) {
             return;
         }
-        report();
+        requestSnapshot();
         next_ += kInterval;
         schedule();
     });
 }
 
-void StatusReporter::report() {
-    const ReceiverSnapshot snapshot = takeSnapshot_();
+void StatusReporter::requestSnapshot() {
+    asio::post(receiveIo_, [this] {
+        // On the receive thread: copy, hand back, done. Formatting and writing
+        // happen on the control thread.
+        asio::post(control_, [this, snapshot = takeSnapshot_()] {
+            if (!stopping_) {
+                report(snapshot);
+            }
+        });
+    });
+}
+
+void StatusReporter::report(const ReceiverSnapshot& snapshot) {
     reportEvents(snapshot);
     showStatus(statusLine(snapshot));
 }
 
 void StatusReporter::reportEvents(const ReceiverSnapshot& snapshot) {
+    const ReceiveStats& stats = snapshot.stats;
     const std::uint32_t frames = snapshot.framesPerPacket;
     if (frames != seenFramesPerPacket_) {
         std::ostringstream msg;
@@ -66,20 +81,20 @@ void StatusReporter::reportEvents(const ReceiverSnapshot& snapshot) {
         seenFramesPerPacket_ = frames;
     }
 
-    if (stats_.receiveErrors > seenReceiveErrors_) {
+    if (stats.receiveErrors > seenReceiveErrors_) {
         std::ostringstream msg;
-        msg << "receive: " << stats_.lastReceiveError.message();
-        if (stats_.receiveErrors - seenReceiveErrors_ > 1) {
-            msg << " (and " << (stats_.receiveErrors - seenReceiveErrors_ - 1) << " more)";
+        msg << "receive: " << stats.lastReceiveError.message();
+        if (stats.receiveErrors - seenReceiveErrors_ > 1) {
+            msg << " (and " << (stats.receiveErrors - seenReceiveErrors_ - 1) << " more)";
         }
         printEvent(msg.str());
-        seenReceiveErrors_ = stats_.receiveErrors;
+        seenReceiveErrors_ = stats.receiveErrors;
     }
 
-    if (stats_.sizeMismatches > 0 && !reportedSizeMismatch_) {
+    if (stats.sizeMismatches > 0 && !reportedSizeMismatch_) {
         std::ostringstream msg;
-        msg << "payload is " << stats_.lastMismatchBytes << " bytes for "
-            << stats_.lastMismatchFrames << " frames, but this device wants "
+        msg << "payload is " << stats.lastMismatchBytes << " bytes for "
+            << stats.lastMismatchFrames << " frames, but this device wants "
             << bytesPerFrame_ << " bytes per frame";
         printEvent(msg.str());
         reportedSizeMismatch_ = true;
@@ -87,6 +102,7 @@ void StatusReporter::reportEvents(const ReceiverSnapshot& snapshot) {
 }
 
 std::string StatusReporter::statusLine(const ReceiverSnapshot& snapshot) const {
+    const ReceiveStats& stats = snapshot.stats;
     const ReceiveWindow& window = snapshot.window;
     const double senderRate = snapshot.senderRate;
     const double deviceRate = playback_.deviceRate.load(std::memory_order_relaxed);
@@ -111,6 +127,14 @@ std::string StatusReporter::statusLine(const ReceiverSnapshot& snapshot) const {
         line << "--";
     }
 
+    line << "  headroom ";
+    if (const std::int64_t headroom = playback_.headroom.load(std::memory_order_relaxed);
+        headroom != PlaybackStats::kHeadroomUnknown) {
+        line << headroom << '/' << playback_.targetHeadroom.load(std::memory_order_relaxed);
+    } else {
+        line << "--";
+    }
+
     line << "  ring ";
     if (window.packets > 0) {
         line << window.minFill << '-' << window.maxFill;
@@ -118,16 +142,17 @@ std::string StatusReporter::statusLine(const ReceiverSnapshot& snapshot) const {
         line << "--";
     }
 
-    line << "  lost " << stats_.lostFrames
-         << "  drops " << stats_.ringDrops
-         << "  underruns " << playback_.underrunFrames.load(std::memory_order_relaxed);
+    line << "  lost " << stats.lostFrames
+         << "  drops " << stats.ringDrops
+         << "  underruns " << playback_.underrunFrames.load(std::memory_order_relaxed)
+         << "  trimmed " << playback_.trimmedFrames.load(std::memory_order_relaxed);
 
     // Rare trouble, shown once it has happened.
-    appendIfAny(line, "conceal-fail", stats_.concealFailures);
-    appendIfAny(line, "resyncs", stats_.resyncs);
-    appendIfAny(line, "size-mismatch", stats_.sizeMismatches);
-    appendIfAny(line, "rx-err", stats_.receiveErrors);
-    appendIfAny(line, "runts", stats_.runtPackets);
+    appendIfAny(line, "conceal-fail", stats.concealFailures);
+    appendIfAny(line, "resyncs", stats.resyncs);
+    appendIfAny(line, "size-mismatch", stats.sizeMismatches);
+    appendIfAny(line, "rx-err", stats.receiveErrors);
+    appendIfAny(line, "runts", stats.runtPackets);
 
     // Last, so a narrow terminal cuts the details rather than the above.
     line << "  sender ";

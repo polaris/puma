@@ -14,8 +14,12 @@
 #include "receive_stats.h"
 
 // Keeps a status line up to date on stderr, and prints what the receiver only
-// counts as lines of their own above it. Runs on the io thread, like the
-// packet receiver, so it reads ReceiveStats without synchronisation.
+// counts as lines of their own above it.
+//
+// Runs on a control io_context of its own, never on the receive thread: a
+// terminal that stalls a write must not hold up packets. Once per interval it
+// posts a request to the receive thread, which makes a snapshot and posts it
+// back by value, so neither side locks and ReceiveStats stays single-threaded.
 class StatusReporter {
 public:
     using Clock = std::chrono::steady_clock;
@@ -23,9 +27,9 @@ public:
 
     static constexpr auto kInterval = std::chrono::seconds(1);
 
-    // `takeSnapshot` is called once per interval, on the io thread, and is
+    // `takeSnapshot` is called on the thread running `receiveIo`, and is
     // expected to start a new ReceiveWindow each time.
-    StatusReporter(asio::io_context& io, SnapshotSource takeSnapshot, const ReceiveStats& stats,
+    StatusReporter(asio::io_context& control, asio::io_context& receiveIo, SnapshotSource takeSnapshot,
                    const PlaybackStats& playback, unsigned int nominalRate, std::size_t bytesPerFrame,
                    Clock::time_point origin);
 
@@ -34,13 +38,14 @@ public:
 
     void start();
 
-    // Io thread only. Leaves the last status line on screen. No final report:
-    // playback has stopped by now, so the ring fill would be misleading.
+    // On the control thread, or after `control` has stopped running. Leaves
+    // the last status line on screen; snapshots still in flight are dropped.
     void stop();
 
 private:
     void schedule();
-    void report();
+    void requestSnapshot();
+    void report(const ReceiverSnapshot& snapshot);
     void reportEvents(const ReceiverSnapshot& snapshot);
     [[nodiscard]] std::string statusLine(const ReceiverSnapshot& snapshot) const;
 
@@ -51,10 +56,11 @@ private:
     void printEvent(const std::string& msg);
     void showStatus(std::string line);
 
+    asio::io_context& control_;
+    asio::io_context& receiveIo_;
     asio::steady_timer timer_;
     Clock::time_point next_;
     const SnapshotSource takeSnapshot_;
-    const ReceiveStats& stats_;
     const PlaybackStats& playback_;
     const unsigned int nominalRate_;
     const std::size_t bytesPerFrame_;

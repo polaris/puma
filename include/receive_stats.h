@@ -28,12 +28,20 @@ struct ReceiveStats {
     std::uint32_t lastMismatchFrames = 0;
 };
 
-// Written on the audio thread, read on the io thread. On cache lines of its
-// own, so the audio thread's stores do not contend with ReceiveStats.
+// Written on the audio thread, read by the status reporter. On cache lines of
+// its own, so the audio thread's stores do not contend with anything else.
 struct alignas(128) PlaybackStats {
+    static constexpr std::int64_t kHeadroomUnknown = std::numeric_limits<std::int64_t>::min();
+
     std::atomic<std::uint64_t> underrunFrames{0};
+    std::atomic<std::uint64_t> trimmedFrames{0};
+    // Lowest (ring fill before a read - frames read) over the last trim window.
+    // Negative when that window underran; kHeadroomUnknown until primed.
+    std::atomic<std::int64_t> headroom{kHeadroomUnknown};
+    std::atomic<std::uint64_t> targetHeadroom{0};    // what trimming currently keeps; adapts to underruns
     std::atomic<double> deviceRate{0.0};    // frames per second of steady_clock time; 0 until known
 };
+static_assert(std::atomic<std::int64_t>::is_always_lock_free);
 static_assert(std::atomic<double>::is_always_lock_free);
 
 // Figures for one reporting interval, gathered per packet.
@@ -60,7 +68,10 @@ struct ReceiveWindow {
 };
 
 // What the status reporter takes from the packet receiver once per interval.
+// Made on the io thread and handed over by value, so the reporter never
+// touches the receiver's state.
 struct ReceiverSnapshot {
+    ReceiveStats stats;
     ReceiveWindow window;
     double senderRate = 0.0;            // frames per second of steady_clock time; 0 until locked on
     std::uint32_t framesPerPacket = 0;  // 0 until the first packet

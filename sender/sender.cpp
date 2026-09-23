@@ -10,12 +10,14 @@
 #include "audio_recorder.h"
 #include "netint.h"
 #include "packet_ring.h"
+#include "thread_priority.h"
 
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <iostream>
 #include <optional>
 #include <semaphore>
@@ -30,6 +32,9 @@ constexpr std::size_t kHeaderBytes = 16;    // seq(4) + frames(4) + timestamp(8)
 constexpr ma_uint32   kPeriodSizeInFrames = 240;
 constexpr ma_uint32   kNumPeriods = 3;
 constexpr ma_uint32   kCaptureDeviceIndex = 0;      // no option for this yet
+
+// CPU the send thread needs per packet, at most; for the real-time scheduler.
+constexpr auto kSendComputation = std::chrono::microseconds(500);
 
 struct SenderContext {
     PacketRing ring;
@@ -148,7 +153,13 @@ int main(int argc, char** argv) {
 
     std::size_t highWater = 0;
  
-    std::thread worker([&ctx, &tx, &highWater]() {
+    const auto packetPeriod = std::chrono::nanoseconds(
+        std::chrono::seconds(kPeriodSizeInFrames)) / recorder.sampleRate();
+    std::promise<bool> realtime;
+    std::future<bool> realtimeResult = realtime.get_future();
+
+    std::thread worker([&ctx, &tx, &highWater, &realtime, packetPeriod]() {
+        realtime.set_value(rt::makeCurrentThreadRealtime(packetPeriod, kSendComputation));
         while (ctx.running.load(std::memory_order_relaxed)) {
             ctx.wake.acquire();
             const auto d = ctx.ring.size();
@@ -166,6 +177,10 @@ int main(int argc, char** argv) {
         }
     });
  
+    if (!realtimeResult.get()) {
+        std::cerr << "Could not give the send thread real-time priority; it runs at normal priority\n";
+    }
+
     // Unlike the receiver, the worker has to exist before the device starts:
     // it is the consumer the callback hands slots to, so starting first would
     // drop the opening packets. That is what makes this failure path join.
