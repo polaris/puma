@@ -52,6 +52,21 @@ struct PlaybackState {
     std::atomic<std::uint64_t> underrunFrames{0};
 };
 
+struct PacketHeader {
+    std::uint32_t seq = 0;
+    std::uint32_t frames = 0;
+    std::uint64_t ts = 0;
+
+};
+
+PacketHeader parsePacketHeader(const std::uint8_t* buf) {
+    PacketHeader header;
+    std::memcpy(&header.seq, buf, 4);
+    std::memcpy(&header.frames, buf + 4, 4);
+    std::memcpy(&header.ts, buf + 8, 8);
+    return header;
+}
+
 static void onPlayback(void* user, void* output, ma_uint32 frameCount) {
     const auto call = Clock::now();
     auto* const s = static_cast<PlaybackState*>(user);
@@ -231,25 +246,19 @@ int main(int argc, char** argv) {
 
                 const auto arrival = Clock::now();
 
-                std::uint32_t seq;
-                std::memcpy(&seq, buf.data() + 0, 4);
+                const auto header = parsePacketHeader(buf.data());
 
                 if (discard > 0) {
                     --discard;
-                    expectedSeq = seq + 1;
+                    expectedSeq = header.seq + 1;
                     arm();
                     return;
                 }
 
-                ma_uint32 frames;
-                std::memcpy(&frames, buf.data() + 4, 4);
-                std::uint64_t ts;
-                std::memcpy(&ts, buf.data() + 8, 8);
-
-                const std::uint32_t gap = seq - expectedSeq;   // unsigned, wrap-safe
+                const std::uint32_t gap = header.seq - expectedSeq;   // unsigned, wrap-safe
                 if (gap != 0) {
                     ++discontinuities;
-                    const std::size_t missing = static_cast<std::size_t>(gap) * frames;
+                    const std::size_t missing = static_cast<std::size_t>(gap) * header.frames;
 
                     if (missing > kRingFrames) {
                         ++resyncs;
@@ -262,16 +271,16 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
-                expectedSeq = seq + 1;
+                expectedSeq = header.seq + 1;
 
-                if (n - kHeaderBytes != frames * bytesPerFrame) {
+                if (n - kHeaderBytes != header.frames * bytesPerFrame) {
                     if (sizeMismatches == 0) {
                         std::cerr << "payload is " << (n - kHeaderBytes) << " bytes for "
-                                  << frames << " frames, but this device wants "
+                                  << header.frames << " frames, but this device wants "
                                   << bytesPerFrame << " bytes per frame\n";
                     }
                     ++sizeMismatches;
-                } else if (!frameRing.write(buf.data() + kHeaderBytes, frames)) {
+                } else if (!frameRing.write(buf.data() + kHeaderBytes, header.frames)) {
                     ++ringDrops;                // whole packet or nothing
                 }
 
@@ -280,18 +289,18 @@ int main(int argc, char** argv) {
                 const double t = seconds(arrival);
 
                 if (!configured) {
-                    filter.configure(kBandwidth, frames, senderSampleRate);
+                    filter.configure(kBandwidth, header.frames, senderSampleRate);
                     filter.reset(t);
                     configured = true;
-                    std::cerr << "filtering " << frames << " frames/callback at nominal "
+                    std::cerr << "filtering " << header.frames << " frames/callback at nominal "
                               << senderSampleRate << " Hz\n";
                     return;
                 }
 
-                if (frames != filter.framesPerPeriod()) {
-                    std::cerr << "frame count changed " << filter.framesPerPeriod() << " -> " << frames
+                if (header.frames != filter.framesPerPeriod()) {
+                    std::cerr << "frame count changed " << filter.framesPerPeriod() << " -> " << header.frames
                               << ", resyncing\n";
-                    filter.configure(kBandwidth, frames, senderSampleRate);
+                    filter.configure(kBandwidth, header.frames, senderSampleRate);
                     filter.invalidate();
                 }
 
