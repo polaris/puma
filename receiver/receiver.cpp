@@ -47,19 +47,16 @@ struct ReceiveStats {
 };
 
 struct PlaybackState {
+    unsigned int sampleRate = 0;
+    unsigned int periodSizeInSamples = 0;
+    std::size_t bytesPerFrame = 0;
+    
+    Ring* ring = nullptr;
+    ReceiveStats* stats = nullptr;
+
     std::chrono::steady_clock::time_point origin;
     bool configured = false;
     TimeFilter timeFilter{};
-    unsigned int sampleRate = 0;
-    unsigned int periodSizeInSamples = 0;
-
-    // Filled in after the device is open and before it is started, because the
-    // audio thread reads them and does not exist until start().
-    Ring* ring = nullptr;
-    std::size_t bytesPerFrame = 0;
-
-    // Written on the audio thread, read on shutdown.
-    ReceiveStats* stats = nullptr;
 };
 
 struct PacketHeader {
