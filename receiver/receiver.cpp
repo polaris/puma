@@ -36,6 +36,16 @@ using Ring = FrameRing<kRingFrames>;
 void enumerateNetworkInterfaces();
 void enumerateOutputDevices(const AudioContext& audio);
 
+struct ReceiveStats {
+    std::uint64_t discontinuities = 0;
+    std::uint64_t ringDrops = 0;        // packets the ring had no room for
+    std::uint64_t lostFrames = 0;       // frames the sender sent that never arrived
+    std::uint64_t concealFailures = 0;  // holes the ring was too full to patch
+    std::uint64_t resyncs = 0;          // holes too large to patch at all
+    std::uint64_t sizeMismatches = 0;   // payloads that are not frames * bytesPerFrame
+    std::atomic<std::uint64_t> underrunFrames{0};
+};
+
 struct PlaybackState {
     std::chrono::steady_clock::time_point origin;
     bool configured = false;
@@ -49,7 +59,7 @@ struct PlaybackState {
     std::size_t bytesPerFrame = 0;
 
     // Written on the audio thread, read on shutdown.
-    std::atomic<std::uint64_t> underrunFrames{0};
+    ReceiveStats* stats = nullptr;
 };
 
 struct PacketHeader {
@@ -65,6 +75,18 @@ PacketHeader parsePacketHeader(const std::uint8_t* buf) {
     std::memcpy(&header.frames, buf + 4, 4);
     std::memcpy(&header.ts, buf + 8, 8);
     return header;
+}
+
+void printReceiveStats(const ReceiveStats& stats) {
+    std::cerr << "discontinuities " << stats.discontinuities
+              << ", lost frames " << stats.lostFrames
+              << ", conceal failures " << stats.concealFailures
+              << ", resyncs " << stats.resyncs
+              << ", ring drops " << stats.ringDrops
+              << ", size mismatches " << stats.sizeMismatches
+              << ", underrun frames " << stats.underrunFrames.load()
+              << "\n";
+
 }
 
 static void onPlayback(void* user, void* output, ma_uint32 frameCount) {
@@ -84,7 +106,7 @@ static void onPlayback(void* user, void* output, ma_uint32 frameCount) {
     if (got < frameCount) {
         const std::size_t short_ = frameCount - got;
         std::memset(out + got * s->bytesPerFrame, 0, short_ * s->bytesPerFrame);
-        s->underrunFrames.fetch_add(short_, std::memory_order_relaxed);
+        s->stats->underrunFrames.fetch_add(short_, std::memory_order_relaxed);
     }
 }
 
@@ -165,6 +187,7 @@ int main(int argc, char** argv) {
     playerConfig.periods = kNumPeriods;
 
     Ring frameRing;
+    ReceiveStats stats;
 
     const auto origin  = Clock::now();
 
@@ -172,6 +195,7 @@ int main(int argc, char** argv) {
         .origin = origin,
         .sampleRate = senderSampleRate,
         .periodSizeInSamples = periodSizeInFrames,
+        .stats = &stats,
     };
 
     AudioPlayer player;
@@ -205,12 +229,7 @@ int main(int argc, char** argv) {
     int discard = 10;
 
     std::uint32_t expectedSeq = 0;
-    std::uint64_t discontinuities = 0;
-    std::uint64_t ringDrops = 0;        // packets the ring had no room for
-    std::uint64_t lostFrames = 0;       // frames the sender sent that never arrived
-    std::uint64_t concealFailures = 0;  // holes the ring was too full to patch
-    std::uint64_t resyncs = 0;          // holes too large to patch at all
-    std::uint64_t sizeMismatches = 0;   // payloads that are not frames * bytesPerFrame
+
     bool stopping = false;      // io thread only, set by the teardown below
 
     const auto insertSilence = [&](std::size_t missing) {
@@ -257,31 +276,31 @@ int main(int argc, char** argv) {
 
                 const std::uint32_t gap = header.seq - expectedSeq;   // unsigned, wrap-safe
                 if (gap != 0) {
-                    ++discontinuities;
+                    ++stats.discontinuities;
                     const std::size_t missing = static_cast<std::size_t>(gap) * header.frames;
 
                     if (missing > kRingFrames) {
-                        ++resyncs;
+                        ++stats.resyncs;
                         filter.invalidate();
                     } else {
-                        lostFrames += missing;
+                        stats.lostFrames += missing;
                         filter.skip(gap);
                         if (!insertSilence(missing)) {
-                            ++concealFailures;
+                            ++stats.concealFailures;
                         }
                     }
                 }
                 expectedSeq = header.seq + 1;
 
                 if (n - kHeaderBytes != header.frames * bytesPerFrame) {
-                    if (sizeMismatches == 0) {
+                    if (stats.sizeMismatches == 0) {
                         std::cerr << "payload is " << (n - kHeaderBytes) << " bytes for "
                                   << header.frames << " frames, but this device wants "
                                   << bytesPerFrame << " bytes per frame\n";
                     }
-                    ++sizeMismatches;
+                    ++stats.sizeMismatches;
                 } else if (!frameRing.write(buf.data() + kHeaderBytes, header.frames)) {
-                    ++ringDrops;                // whole packet or nothing
+                    ++stats.ringDrops;                // whole packet or nothing
                 }
 
                 arm();
@@ -348,14 +367,7 @@ int main(int argc, char** argv) {
     });
     worker.join();
 
-    std::cerr << "discontinuities " << discontinuities
-              << ", lost frames " << lostFrames
-              << ", conceal failures " << concealFailures
-              << ", resyncs " << resyncs
-              << ", ring drops " << ringDrops
-              << ", size mismatches " << sizeMismatches
-              << ", underrun frames " << state.underrunFrames.load()
-              << "\n";
+    printReceiveStats(stats);
 
     return 0;
 }
