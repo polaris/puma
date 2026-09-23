@@ -52,6 +52,27 @@ struct PlaybackState {
     std::atomic<std::uint64_t> underrunFrames{0};
 };
 
+static void onPlayback(void* user, void* output, ma_uint32 frameCount) {
+    const auto call = Clock::now();
+    auto* const s = static_cast<PlaybackState*>(user);
+    const auto t = std::chrono::duration<double>(call - s->origin).count();
+    if (!s->configured) {
+        s->timeFilter.configure(kBandwidth, s->periodSizeInSamples, s->sampleRate);
+        s->timeFilter.reset(t);
+        s->configured = true;
+    } else {
+        s->timeFilter.update(t);
+    }
+
+    auto* const out = static_cast<std::uint8_t*>(output);
+    const std::size_t got = s->ring->read(out, frameCount);
+    if (got < frameCount) {
+        const std::size_t short_ = frameCount - got;
+        std::memset(out + got * s->bytesPerFrame, 0, short_ * s->bytesPerFrame);
+        s->underrunFrames.fetch_add(short_, std::memory_order_relaxed);
+    }
+}
+
 int main(int argc, char** argv) {
     CLI::App app{"Receiver"};
     argv = app.ensure_utf8(argv);
@@ -139,29 +160,7 @@ int main(int argc, char** argv) {
     };
 
     AudioPlayer player;
-    if (!player.open(audio, audio.playbackInfo(outputDeviceIndex).id, playerConfig, 
-        [](void* user, void* output, ma_uint32 frameCount) {
-            const auto call = Clock::now();
-            auto* const s = static_cast<PlaybackState*>(user);
-            const auto t = std::chrono::duration<double>(call - s->origin).count();
-            if (!s->configured) {
-                s->timeFilter.configure(kBandwidth, s->periodSizeInSamples, s->sampleRate);
-                s->timeFilter.reset(t);
-                s->configured = true;
-            } else {
-                s->timeFilter.update(t);
-            }
-
-            // The buffer has to be filled on every call, including the first:
-            // returning early would hand the device whatever was in it.
-            auto* const out = static_cast<std::uint8_t*>(output);
-            const std::size_t got = s->ring->read(out, frameCount);
-            if (got < frameCount) {
-                const std::size_t short_ = frameCount - got;
-                std::memset(out + got * s->bytesPerFrame, 0, short_ * s->bytesPerFrame);
-                s->underrunFrames.fetch_add(short_, std::memory_order_relaxed);
-            }
-        }, &state)) {
+    if (!player.open(audio, audio.playbackInfo(outputDeviceIndex).id, playerConfig, onPlayback, &state)) {
         std::cerr << "Failed to open the selected output device\n";
         return 2;
     }
@@ -247,8 +246,6 @@ int main(int argc, char** argv) {
                 std::uint64_t ts;
                 std::memcpy(&ts, buf.data() + 8, 8);
 
-                arm();
-
                 const std::uint32_t gap = seq - expectedSeq;   // unsigned, wrap-safe
                 if (gap != 0) {
                     ++discontinuities;
@@ -277,6 +274,8 @@ int main(int argc, char** argv) {
                 } else if (!frameRing.write(buf.data() + kHeaderBytes, frames)) {
                     ++ringDrops;                // whole packet or nothing
                 }
+
+                arm();
 
                 const double t = seconds(arrival);
 
