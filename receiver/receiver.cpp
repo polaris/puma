@@ -179,12 +179,13 @@ int main(int argc, char** argv) {
     net::configureReceiver(rx, group, *chosen);
     std::cout << "Receiver configured\n";
 
-    AudioPlayer::Config playerConfig;
-    playerConfig.format = ma_format_s16;
-    playerConfig.channels = 0;     // native
-    playerConfig.sampleRate = senderSampleRate;
-    playerConfig.periodSizeInFrames = periodSizeInFrames;
-    playerConfig.periods = kNumPeriods;
+    AudioPlayer::Config playerConfig {
+        .format = ma_format_s16,
+        .channels = 0,     // native
+        .sampleRate = senderSampleRate,
+        .periodSizeInFrames = periodSizeInFrames,
+        .periods = kNumPeriods,
+    };
 
     Ring frameRing;
     ReceiveStats stats;
