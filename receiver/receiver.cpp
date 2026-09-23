@@ -1,5 +1,6 @@
 
 #include <asio.hpp>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -106,6 +107,167 @@ static void onPlayback(void* user, void* output, ma_uint32 frameCount) {
         s->stats->underrunFrames.fetch_add(short_, std::memory_order_relaxed);
     }
 }
+
+class PacketReceiver {
+public:
+    PacketReceiver(udp::socket& rx, Ring& ring, ReceiveStats& stats, std::size_t bytesPerFrame,
+                   unsigned int sampleRate, Clock::time_point origin)
+    : rx_{rx}
+    , ring_{ring}
+    , stats_{stats}
+    , bytesPerFrame_{bytesPerFrame}
+    , sampleRate_{sampleRate}
+    , origin_{origin} {
+    }
+
+    PacketReceiver(const PacketReceiver&) = delete;
+    PacketReceiver& operator=(const PacketReceiver&) = delete;
+
+    void start() {
+        arm();
+    }
+
+    void stop() {
+        stopping_ = true;
+        asio::error_code ignored;
+        rx_.close(ignored);
+    }
+
+private:
+    void arm() {
+        rx_.async_receive(asio::buffer(buf_),
+            [this](const asio::error_code& ec, std::size_t n) { onReceive(ec, n); });
+    }
+
+    void onReceive(const asio::error_code& ec, std::size_t n) {
+        if (stopping_ || ec == asio::error::operation_aborted) {
+            return;
+        }
+        if (ec) {
+            arm();
+            std::cerr << "receive: " << ec.message() << "\n";
+            return;
+        }
+        if (n < kHeaderBytes) {
+            arm();
+            std::cerr << "packet too small\n";
+            return;
+        }
+
+        const auto arrival = Clock::now();
+        const auto header = parsePacketHeader(buf_.data());
+
+        if (discard_ > 0) {
+            --discard_;
+            expectedSeq_ = header.seq + 1;
+            arm();
+            return;
+        }
+
+        const std::uint32_t gap = header.seq - expectedSeq_;
+        if (gap != 0) {
+            concealGap(gap, header.frames);
+        }
+        expectedSeq_ = header.seq + 1;
+
+        storePayload(header.frames, n - kHeaderBytes);
+
+        arm();
+
+        trackTiming(arrival, header.frames);
+    }
+
+    void concealGap(std::uint32_t gap, std::uint32_t frames) {
+        ++stats_.discontinuities;
+        const std::size_t missing = static_cast<std::size_t>(gap) * frames;
+
+        if (missing > kRingFrames) {
+            ++stats_.resyncs;
+            filter_.invalidate();
+            return;
+        }
+
+        stats_.lostFrames += missing;
+        filter_.skip(gap);
+        if (!insertSilence(missing)) {
+            ++stats_.concealFailures;
+        }
+    }
+
+    bool insertSilence(std::size_t missing) {
+        const Regions regions = ring_.acquireWrite(missing);
+        if (regions.frames() < missing) {
+            return false;
+        }
+        for (const Region* part : {&regions.region1(), &regions.region2()}) {
+            if (part->len > 0) {
+                std::memset(part->buf, 0, part->len * bytesPerFrame_);
+            }
+        }
+        return ring_.commitWrite(missing);
+    }
+
+    void storePayload(std::uint32_t frames, std::size_t payloadBytes) {
+        if (payloadBytes != frames * bytesPerFrame_) {
+            if (stats_.sizeMismatches == 0) {
+                std::cerr << "payload is " << payloadBytes << " bytes for "
+                          << frames << " frames, but this device wants "
+                          << bytesPerFrame_ << " bytes per frame\n";
+            }
+            ++stats_.sizeMismatches;
+        } else if (!ring_.write(buf_.data() + kHeaderBytes, frames)) {
+            ++stats_.ringDrops;                // whole packet or nothing
+        }
+    }
+
+    void trackTiming(Clock::time_point arrival, std::uint32_t frames) {
+        const double t = std::chrono::duration<double>(arrival - origin_).count();
+
+        if (!filterConfigured_) {
+            filter_.configure(kBandwidth, frames, sampleRate_);
+            filter_.reset(t);
+            filterConfigured_ = true;
+            std::cerr << "filtering " << frames << " frames/callback at nominal "
+                      << sampleRate_ << " Hz\n";
+            return;
+        }
+
+        if (frames != filter_.framesPerPeriod()) {
+            std::cerr << "frame count changed " << filter_.framesPerPeriod() << " -> " << frames
+                      << ", resyncing\n";
+            filter_.configure(kBandwidth, frames, sampleRate_);
+            filter_.invalidate();
+        }
+
+        if (!filter_.ready()) {
+            filter_.reset(t);
+            return;
+        }
+
+        filter_.update(t);
+
+        std::cout << filter_.frame() << ' ' << std::fixed
+                  << std::setprecision(9) << filter_.time() << ' '
+                  << std::setprecision(9) << filter_.error() << ' '
+                  << std::setprecision(12) << filter_.period() << ' '
+                  << std::setprecision(4) << filter_.rate() << '\n';
+    }
+
+    udp::socket& rx_;
+    Ring& ring_;
+    ReceiveStats& stats_;
+    const std::size_t bytesPerFrame_;
+    const unsigned int sampleRate_;
+    const Clock::time_point origin_;
+
+    TimeFilter filter_;
+    bool filterConfigured_ = false;
+    int discard_ = 10;
+    std::uint32_t expectedSeq_ = 0;
+    bool stopping_ = false;
+
+    std::array<std::uint8_t, 8192> buf_;    // last, so the hot members share cache lines
+};
 
 int main(int argc, char** argv) {
     CLI::App app{"Receiver"};
@@ -217,131 +379,14 @@ int main(int argc, char** argv) {
     state.ring = &frameRing;
     state.bytesPerFrame = bytesPerFrame;
 
-    const auto seconds = [origin](Clock::time_point tp) {
-        return std::chrono::duration<double>(tp - origin).count();
-    };
-
-    std::array<std::uint8_t, 8192> buf;
-    TimeFilter filter;
-    bool configured = false;
-    int discard = 10;
-
-    std::uint32_t expectedSeq = 0;
-
-    bool stopping = false;      // io thread only, set by the teardown below
-
-    const auto insertSilence = [&](std::size_t missing) {
-        const Regions regions = frameRing.acquireWrite(missing);
-        if (regions.frames() < missing) {
-            return false;
-        }
-        for (const Region* part : {&regions.region1(), &regions.region2()}) {
-            if (part->len > 0) {
-                std::memset(part->buf, 0, part->len * bytesPerFrame);
-            }
-        }
-        return frameRing.commitWrite(missing);
-    };
-
-    std::function<void()> arm = [&] {
-        rx.async_receive(asio::buffer(buf),
-            [&](const asio::error_code& ec, std::size_t n) {
-                if (stopping || ec == asio::error::operation_aborted) {
-                    return;
-                }
-                if (ec) { 
-                    arm();
-                    std::cerr << "receive: " << ec.message() << "\n";
-                    return;
-                }                
-
-                if (n < 16) {
-                    arm();
-                    std::cerr << "packet too small\n";
-                    return;
-                }
-
-                const auto arrival = Clock::now();
-
-                const auto header = parsePacketHeader(buf.data());
-
-                if (discard > 0) {
-                    --discard;
-                    expectedSeq = header.seq + 1;
-                    arm();
-                    return;
-                }
-
-                const std::uint32_t gap = header.seq - expectedSeq;   // unsigned, wrap-safe
-                if (gap != 0) {
-                    ++stats.discontinuities;
-                    const std::size_t missing = static_cast<std::size_t>(gap) * header.frames;
-
-                    if (missing > kRingFrames) {
-                        ++stats.resyncs;
-                        filter.invalidate();
-                    } else {
-                        stats.lostFrames += missing;
-                        filter.skip(gap);
-                        if (!insertSilence(missing)) {
-                            ++stats.concealFailures;
-                        }
-                    }
-                }
-                expectedSeq = header.seq + 1;
-
-                if (n - kHeaderBytes != header.frames * bytesPerFrame) {
-                    if (stats.sizeMismatches == 0) {
-                        std::cerr << "payload is " << (n - kHeaderBytes) << " bytes for "
-                                  << header.frames << " frames, but this device wants "
-                                  << bytesPerFrame << " bytes per frame\n";
-                    }
-                    ++stats.sizeMismatches;
-                } else if (!frameRing.write(buf.data() + kHeaderBytes, header.frames)) {
-                    ++stats.ringDrops;                // whole packet or nothing
-                }
-
-                arm();
-
-                const double t = seconds(arrival);
-
-                if (!configured) {
-                    filter.configure(kBandwidth, header.frames, senderSampleRate);
-                    filter.reset(t);
-                    configured = true;
-                    std::cerr << "filtering " << header.frames << " frames/callback at nominal "
-                              << senderSampleRate << " Hz\n";
-                    return;
-                }
-
-                if (header.frames != filter.framesPerPeriod()) {
-                    std::cerr << "frame count changed " << filter.framesPerPeriod() << " -> " << header.frames
-                              << ", resyncing\n";
-                    filter.configure(kBandwidth, header.frames, senderSampleRate);
-                    filter.invalidate();
-                }
-
-                if (!filter.ready()) {
-                    filter.reset(t);
-                    return;
-                }
-
-                filter.update(t);
-
-                std::cout << filter.frame() << ' ' << std::fixed
-                          << std::setprecision(9) << filter.time() << ' '
-                          << std::setprecision(9) << filter.error() << ' '
-                          << std::setprecision(12) << filter.period() << ' '
-                          << std::setprecision(4) << filter.rate() << '\n';
-            });
-    };
+    PacketReceiver receiver(rx, frameRing, stats, bytesPerFrame, senderSampleRate, origin);
 
     if (!player.start()) {
         std::cerr << "Failed to start the playback device\n";
         return 2;
     }
 
-    arm();
+    receiver.start();
     std::thread worker([&]{ io.run(); });
 
     asio::io_context wait;
@@ -355,14 +400,8 @@ int main(int argc, char** argv) {
 
     player.stop();
 
-    // Close from inside the io thread, and latch the flag first so nothing
-    // re-arms afterwards. close() here is the non-throwing overload: an
-    // exception escaping a handler would take down io.run().
-    asio::post(io, [&]{
-        stopping = true;
-        asio::error_code ignored;
-        rx.close(ignored);
-    });
+    // Close from inside the io thread.
+    asio::post(io, [&receiver]{ receiver.stop(); });
     worker.join();
 
     printReceiveStats(stats);
