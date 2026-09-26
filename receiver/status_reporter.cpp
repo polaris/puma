@@ -153,6 +153,8 @@ std::string StatusReporter::statusLine(const ReceiverSnapshot& snapshot) const {
     appendIfAny(line, "size-mismatch", stats.sizeMismatches);
     appendIfAny(line, "rx-err", stats.receiveErrors);
     appendIfAny(line, "runts", stats.runtPackets);
+    appendIfAny(line, "bad-header", stats.badHeaders);
+    appendIfAny(line, "sessions", stats.sessionChanges);
 
     // Last, so a narrow terminal cuts the details rather than the above.
     line << "  sender ";

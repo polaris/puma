@@ -20,6 +20,8 @@ struct ReceiveStats {
     std::uint64_t sizeMismatches = 0;   // payloads that are not frames * bytesPerFrame
     std::uint64_t receiveErrors = 0;
     std::uint64_t runtPackets = 0;      // shorter than the header
+    std::uint64_t badHeaders = 0;       // wrong magic or protocol version
+    std::uint64_t sessionChanges = 0;   // sender restarts
     std::uint64_t frameCountChanges = 0;
 
     // Details of the most recent occurrence, for the status reporter.

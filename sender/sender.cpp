@@ -7,6 +7,7 @@
 #include <miniaudio.h>
 
 #include "audio_context.h"
+#include "audio_packet.h"
 #include "audio_recorder.h"
 #include "netint.h"
 #include "packet_ring.h"
@@ -20,6 +21,7 @@
 #include <future>
 #include <iostream>
 #include <optional>
+#include <random>
 #include <semaphore>
 #include <string>
 #include <thread>
@@ -28,7 +30,8 @@
 using Clock = std::chrono::steady_clock;
 using asio::ip::udp;
 
-constexpr std::size_t kHeaderBytes = 16;    // seq(4) + frames(4) + timestamp(8)
+using streaming::kAudioPacketHeaderBytes;
+
 constexpr ma_uint32   kPeriodSizeInFrames = 240;
 constexpr ma_uint32   kNumPeriods = 3;
 constexpr ma_uint32   kCaptureDeviceIndex = 0;      // no option for this yet
@@ -43,6 +46,7 @@ struct SenderContext {
     std::atomic<std::uint64_t> dropped{0};
     std::atomic<std::uint64_t> oversize{0};
     Clock::time_point origin;
+    std::uint32_t session = 0;       // new for every run, so receivers can tell a restart from loss
     std::uint32_t sequence = 0;      // audio thread only
     std::size_t bytesPerFrame = 0;
 };
@@ -50,7 +54,7 @@ struct SenderContext {
 void data_callback(void* user, const void* input, ma_uint32 frameCount) {
     auto* ctx = static_cast<SenderContext*>(user);
  
-    const std::size_t payload = kHeaderBytes + frameCount * ctx->bytesPerFrame;
+    const std::size_t payload = kAudioPacketHeaderBytes + frameCount * ctx->bytesPerFrame;
     if (payload > kMaxPayload) {
         ctx->oversize.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -63,14 +67,17 @@ void data_callback(void* user, const void* input, ma_uint32 frameCount) {
         return;
     }
  
-    const std::uint32_t seq = ctx->sequence++;
-    const std::uint32_t n   = frameCount;
-    const std::uint64_t ts  = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
- 
-    std::memcpy(slot->data.data() +  0, &seq, 4);
-    std::memcpy(slot->data.data() +  4, &n,   4);
-    std::memcpy(slot->data.data() +  8, &ts,  8);
-    std::memcpy(slot->data.data() + kHeaderBytes, input, frameCount * ctx->bytesPerFrame);
+    const streaming::AudioPacketHeader header{
+        .session = ctx->session,
+        .seq     = ctx->sequence++,
+        .frames  = frameCount,
+        .t       = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()),
+    };
+    std::uint8_t encoded[kAudioPacketHeaderBytes];
+    streaming::encodeAudioPacketHeader(header, encoded);
+
+    std::memcpy(slot->data.data(), encoded, kAudioPacketHeaderBytes);
+    std::memcpy(slot->data.data() + kAudioPacketHeaderBytes, input, frameCount * ctx->bytesPerFrame);
     slot->length = static_cast<std::uint32_t>(payload);
  
     ctx->ring.commit();
@@ -117,6 +124,7 @@ int main(int argc, char** argv) {
 
     SenderContext ctx;
     ctx.origin = Clock::now();
+    ctx.session = std::random_device{}();
 
     AudioRecorder::Config recorderConfig;
     recorderConfig.format             = ma_format_s16;
@@ -146,7 +154,7 @@ int main(int argc, char** argv) {
 
     // The callback reads bytesPerFrame, so it has to be set before start().
     ctx.bytesPerFrame = recorder.bytesPerFrame();
-    if (kHeaderBytes + kPeriodSizeInFrames * ctx.bytesPerFrame > kMaxPayload) {
+    if (kAudioPacketHeaderBytes + kPeriodSizeInFrames * ctx.bytesPerFrame > kMaxPayload) {
         std::cerr << "payload too large for slot\n";
         return 3;
     }

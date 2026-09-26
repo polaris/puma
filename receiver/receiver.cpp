@@ -21,6 +21,7 @@
 #include <miniaudio.h>
 
 #include "audio_context.h"
+#include "audio_packet.h"
 #include "audio_player.h"
 #include "netint.h"
 #include "receive_stats.h"
@@ -38,7 +39,7 @@ constexpr unsigned short kDefaultMulticastPort = 12345;
 constexpr unsigned int kDefaultSampleRate = 48000;
 constexpr unsigned int kPeriodSizeInFrames = 240;
 constexpr unsigned int kNumPeriods = 3;
-constexpr std::size_t kHeaderBytes = 16;        // seq(4) + frames(4) + timestamp(8)
+using streaming::kAudioPacketHeaderBytes;
 
 constexpr std::size_t kRingFrames = 2048;
 using Ring = FrameRing<kRingFrames>;
@@ -76,21 +77,6 @@ struct PlaybackState {
     std::array<std::int16_t, kRingFrames * kMaxChannels> scratch{};     // for trimmed reads
 };
 
-struct PacketHeader {
-    std::uint32_t seq = 0;
-    std::uint32_t frames = 0;
-    std::uint64_t ts = 0;
-
-};
-
-PacketHeader parsePacketHeader(const std::uint8_t* buf) {
-    PacketHeader header;
-    std::memcpy(&header.seq, buf, 4);
-    std::memcpy(&header.frames, buf + 4, 4);
-    std::memcpy(&header.ts, buf + 8, 8);
-    return header;
-}
-
 void printReceiveStats(const ReceiveStats& stats, const PlaybackStats& playback) {
     std::cerr << "discontinuities " << stats.discontinuities
               << ", lost frames " << stats.lostFrames
@@ -100,6 +86,8 @@ void printReceiveStats(const ReceiveStats& stats, const PlaybackStats& playback)
               << ", size mismatches " << stats.sizeMismatches
               << ", receive errors " << stats.receiveErrors
               << ", runt packets " << stats.runtPackets
+              << ", bad headers " << stats.badHeaders
+              << ", session changes " << stats.sessionChanges
               << ", frame count changes " << stats.frameCountChanges
               << ", underrun frames " << playback.underrunFrames.load()
               << ", trimmed frames " << playback.trimmedFrames.load()
@@ -274,20 +262,36 @@ private:
             stats_.lastReceiveError = ec;
             return;
         }
-        if (n < kHeaderBytes) {
+        if (n < kAudioPacketHeaderBytes) {
             arm();
             ++stats_.runtPackets;
             return;
         }
 
         const auto arrival = Clock::now();
-        const auto header = parsePacketHeader(buf_.data());
+        const auto decoded = streaming::decodeAudioPacketHeader(buf_.data(), n);
+        if (!decoded) {
+            arm();
+            ++stats_.badHeaders;
+            return;
+        }
+        const streaming::AudioPacketHeader& header = *decoded;
 
         if (discard_ > 0) {
             --discard_;
+            session_ = header.session;
             expectedSeq_ = header.seq + 1;
             arm();
             return;
+        }
+
+        // A restarted sender counts from a sequence of its own: pick it up
+        // as a new stream rather than as a gap.
+        if (header.session != session_) {
+            ++stats_.sessionChanges;
+            session_ = header.session;
+            expectedSeq_ = header.seq;
+            filter_.invalidate();
         }
 
         const std::uint32_t gap = header.seq - expectedSeq_;
@@ -296,7 +300,7 @@ private:
         }
         expectedSeq_ = header.seq + 1;
 
-        storePayload(header.frames, n - kHeaderBytes);
+        storePayload(header.frames, n - kAudioPacketHeaderBytes);
 
         arm();
 
@@ -326,7 +330,7 @@ private:
             ++stats_.sizeMismatches;
             stats_.lastMismatchBytes = payloadBytes;
             stats_.lastMismatchFrames = frames;
-        } else if (!ring_.write(buf_.data() + kHeaderBytes, frames)) {
+        } else if (!ring_.write(buf_.data() + kAudioPacketHeaderBytes, frames)) {
             ++stats_.ringDrops;                // whole packet or nothing
         }
     }
@@ -361,6 +365,7 @@ private:
 
     TimeFilter filter_;
     int discard_ = 10;
+    std::uint32_t session_ = 0;
     std::uint32_t expectedSeq_ = 0;
     bool stopping_ = false;
     ReceiveWindow window_;
