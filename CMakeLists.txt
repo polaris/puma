@@ -66,6 +66,7 @@ add_subdirectory(sender)
 add_subdirectory(receiver)
 add_subdirectory(clocksync)
 add_subdirectory(clocksync-demo)
+add_subdirectory(streaming)
 
 enable_testing()
 add_subdirectory(tests)

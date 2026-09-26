@@ -7,6 +7,7 @@ add_executable(puma_tests
     test_time_filter.cpp
     test_servo_additions.cpp
     test_frame_ring.cpp
+    test_audio_packet.cpp
 )
 
 target_compile_features(puma_tests PRIVATE cxx_std_20)
@@ -14,7 +15,7 @@ target_include_directories(puma_tests PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
 target_compile_definitions(puma_tests PRIVATE FRAME_RING_CHECKS=1)
 
-target_link_libraries(puma_tests PRIVATE clocksync miniaudio::miniaudio Catch2::Catch2WithMain)
+target_link_libraries(puma_tests PRIVATE clocksync streaming miniaudio::miniaudio Catch2::Catch2WithMain)
 
 include(Catch OPTIONAL RESULT_VARIABLE PUMA_CATCH_MODULE)
 if(PUMA_CATCH_MODULE)
