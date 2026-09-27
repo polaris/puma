@@ -63,6 +63,8 @@ class FrameRing {
     static constexpr std::size_t kMask = CapacityFrames - 1;
     static constexpr std::size_t kMinFrameBytes = 2;    // 1 ch * s16
     static constexpr std::size_t kMaxFrameBytes = 16;   // 8 ch * s16
+    static_assert(sizeof(std::size_t) >= sizeof(std::uint64_t),
+                  "frame positions are 64-bit; the counters must not wrap before them");
 
 public:
     // Call once before start(), never after.
@@ -102,7 +104,7 @@ public:
         const std::size_t len1 = std::min(n, CapacityFrames - offset);
         const std::size_t len2 = n - len1;
         checkSplit(requested, n, len1, len2, offset);
-        return Regions{{ len1 > 0 ? frameAt(w)     : nullptr, len1 },
+        return Regions{{ len1 > 0 ? bufferAt(w)    : nullptr, len1 },
                        { len2 > 0 ? buffer_.data() : nullptr, len2 }};
     }
 
@@ -128,7 +130,7 @@ public:
         const std::size_t len1 = std::min(n, CapacityFrames - offset);
         const std::size_t len2 = n - len1;
         checkSplit(requested, n, len1, len2, offset);
-        return Regions{{ len1 > 0 ? frameAt(r)     : nullptr, len1 },
+        return Regions{{ len1 > 0 ? bufferAt(r)    : nullptr, len1 },
                        { len2 > 0 ? buffer_.data() : nullptr, len2 }};
     }
 
@@ -185,13 +187,49 @@ public:
         return commitRead(n) ? n : 0;
     }
 
+    // The frame at absolute position `pos`, read in place without consuming it.
+    // Consumer side only, and only for positions from the read counter up to,
+    // not including, the write counter: below, the producer may already be
+    // overwriting the slot; from there on, nothing has been written yet.
+    [[nodiscard]] const std::uint8_t* frameAt(std::uint64_t pos) const noexcept {
+        FRAME_RING_ASSERT(read_.load(std::memory_order_relaxed) <= pos);
+        FRAME_RING_ASSERT(pos < write_.load(std::memory_order_acquire));
+        return bufferAt(static_cast<std::size_t>(pos));
+    }
+
+    // Absolute position of the next frame to be written, i.e. the number of
+    // frames written since init(). Positions only grow; wrapping around the
+    // buffer happens inside.
+    [[nodiscard]] std::uint64_t writePosition() const noexcept {
+        return write_.load(std::memory_order_acquire);
+    }
+
+    // Absolute position of the next frame to be read.
+    [[nodiscard]] std::uint64_t readPosition() const noexcept {
+        return read_.load(std::memory_order_acquire);
+    }
+
+    // Hands every frame before `pos` back to the producer. Consumer side only.
+    // Refuses to move backwards or past the write position.
+    [[nodiscard]] bool discardUntil(std::uint64_t pos) {
+        const std::size_t r = read_.load(std::memory_order_relaxed);
+        if (pos < r) {
+            return false;
+        }
+        return commitRead(static_cast<std::size_t>(pos) - r);
+    }
+
 private:
     std::size_t bytesPerFrame_ = 0;
     alignas(128) std::atomic<std::size_t> write_{0};
     alignas(128) std::atomic<std::size_t> read_{0};
     alignas(128) std::array<std::uint8_t, CapacityFrames * kMaxFrameBytes> buffer_{};
 
-    [[nodiscard]] std::uint8_t* frameAt(std::size_t counter) noexcept {
+    [[nodiscard]] std::uint8_t* bufferAt(std::size_t counter) noexcept {
+        return buffer_.data() + (counter & kMask) * bytesPerFrame_;
+    }
+
+    [[nodiscard]] const std::uint8_t* bufferAt(std::size_t counter) const noexcept {
         return buffer_.data() + (counter & kMask) * bytesPerFrame_;
     }
 

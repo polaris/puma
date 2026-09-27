@@ -479,6 +479,86 @@ TEST_CASE("the second region starts at the beginning of the buffer", "[frame_rin
     REQUIRE(regions.region1().buf - regions.region2().buf == static_cast<std::ptrdiff_t>(12 * kBytesPerFrame));
 }
 
+TEST_CASE("positions count every frame written and read", "[frame_ring]") {
+    constexpr std::size_t kBytesPerFrame = 4;
+    auto ring = makeRing();
+    REQUIRE(ring->init(kBytesPerFrame));
+    REQUIRE(ring->writePosition() == 0);
+    REQUIRE(ring->readPosition() == 0);
+
+    const std::vector<std::uint8_t> ten = makePattern(10, kBytesPerFrame, 0);
+    REQUIRE(ring->write(ten.data(), 10));
+    REQUIRE(ring->writeSilence(3));
+    REQUIRE(ring->writePosition() == 13);
+
+    std::vector<std::uint8_t> out(10 * kBytesPerFrame);
+    REQUIRE(ring->read(out.data(), 10) == 10);
+    REQUIRE(ring->readPosition() == 10);
+
+    // Past the capacity: positions keep counting, they do not wrap.
+    for (int lap = 0; lap < 5; ++lap) {
+        REQUIRE(ring->write(ten.data(), 10));
+        REQUIRE(ring->read(out.data(), 10) == 10);
+    }
+    REQUIRE(ring->writePosition() == 63);
+    REQUIRE(ring->readPosition() == 60);
+    REQUIRE(ring->availableRead() == 3);
+}
+
+TEST_CASE("frameAt finds a frame by position across the wrap", "[frame_ring]") {
+    constexpr std::size_t kBytesPerFrame = 4;
+    auto ring = makeRing();
+    REQUIRE(ring->init(kBytesPerFrame));
+
+    // Move both positions to 12, so the next 8 frames wrap as 4 + 4.
+    const std::vector<std::uint8_t> filler = makePattern(12, kBytesPerFrame, 0);
+    REQUIRE(ring->write(filler.data(), 12));
+    std::vector<std::uint8_t> drained(filler.size());
+    REQUIRE(ring->read(drained.data(), 12) == 12);
+
+    const std::vector<std::uint8_t> eight = makePattern(8, kBytesPerFrame, 12 * kBytesPerFrame);
+    REQUIRE(ring->write(eight.data(), 8));
+
+    for (std::uint64_t pos = 12; pos < 20; ++pos) {
+        CAPTURE(pos);
+        const std::uint8_t* frame = ring->frameAt(pos);
+        const std::size_t offset = static_cast<std::size_t>(pos - 12) * kBytesPerFrame;
+        REQUIRE(std::equal(frame, frame + kBytesPerFrame, eight.begin() + static_cast<std::ptrdiff_t>(offset)));
+    }
+
+    // Looking does not consume.
+    REQUIRE(ring->readPosition() == 12);
+    REQUIRE(ring->availableRead() == 8);
+}
+
+TEST_CASE("discardUntil releases frames up to a position", "[frame_ring]") {
+    constexpr std::size_t kBytesPerFrame = 2;
+    auto ring = makeRing();
+    REQUIRE(ring->init(kBytesPerFrame));
+
+    const std::vector<std::uint8_t> ten = makePattern(10, kBytesPerFrame, 0);
+    REQUIRE(ring->write(ten.data(), 10));
+
+    REQUIRE(ring->discardUntil(4));
+    REQUIRE(ring->readPosition() == 4);
+    REQUIRE(ring->availableWrite() == ring->capacity() - 6);
+
+    REQUIRE(ring->discardUntil(4));             // where it already is: nothing to do
+    REQUIRE(ring->readPosition() == 4);
+
+    REQUIRE_FALSE(ring->discardUntil(3));       // backwards
+    REQUIRE_FALSE(ring->discardUntil(11));      // past the write position
+    REQUIRE(ring->readPosition() == 4);
+
+    // What follows is still intact.
+    std::vector<std::uint8_t> out(6 * kBytesPerFrame);
+    REQUIRE(ring->read(out.data(), 6) == 6);
+    REQUIRE(out == makePattern(6, kBytesPerFrame, 4 * kBytesPerFrame));
+
+    REQUIRE(ring->discardUntil(10));            // everything, up to the write position
+    REQUIRE(ring->availableRead() == 0);
+}
+
 TEST_CASE("a producer and a consumer thread see every byte in order", "[frame_ring][threads]") {
     constexpr std::size_t kBytesPerFrame = 4;
     constexpr std::size_t kTotalFrames = 100000;
