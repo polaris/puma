@@ -44,6 +44,7 @@ public:
 
     [[nodiscard]] bool ready() const { return ready_; }
     [[nodiscard]] double time() const { return t0_; }
+    [[nodiscard]] double nextTime() const { return t1_; }   // predicted time of the next period
     [[nodiscard]] std::uint64_t frame() const { return n0_; }
     [[nodiscard]] double period() const { return e2_; }
     [[nodiscard]] double error() const { return error_; }
