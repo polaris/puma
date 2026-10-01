@@ -1,4 +1,5 @@
 #include <asio.hpp>
+#include <CLI/CLI.hpp>
 
 // audio_recorder.h pulls in the miniaudio declarations; the implementation
 // block sits outside that header's include guard, so this has to be compiled
@@ -9,13 +10,16 @@
 #include "audio_context.h"
 #include "audio_packet.h"
 #include "audio_recorder.h"
+#include "clock_sync.h"
 #include "netint.h"
 #include "packet_ring.h"
 #include "thread_priority.h"
+#include "time_filter.h"
 
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <future>
@@ -24,6 +28,7 @@
 #include <random>
 #include <semaphore>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -39,6 +44,22 @@ constexpr ma_uint32   kCaptureDeviceIndex = 0;      // no option for this yet
 // CPU the send thread needs per packet, at most; for the real-time scheduler.
 constexpr auto kSendComputation = std::chrono::microseconds(500);
 
+// From capture to the receivers' speakers. It has to cover the worst network
+// delay plus each receiver's output latency; what is left, receivers spend
+// waiting in their ring.
+constexpr double kDefaultLatencyMs = 100.0;
+
+// The capture clock's smoothing: fast at first, so the timeline settles
+// quickly, then slow, so the stamps carry as little callback jitter as possible.
+constexpr double kStartBandwidth = 1.0;    // Hz
+constexpr double kBandwidth = 0.05;        // Hz
+constexpr double kStartSeconds = 4.0;
+
+constexpr std::string_view kAudioGroup = "239.255.0.1";
+constexpr unsigned short kAudioPort = 12345;
+constexpr std::string_view kClockGroup = "239.255.0.2";    // not the audio group
+constexpr unsigned short kClockPort = 12346;
+
 struct SenderContext {
     PacketRing ring;
     std::counting_semaphore<> wake{0};
@@ -46,14 +67,51 @@ struct SenderContext {
     std::atomic<std::uint64_t> dropped{0};
     std::atomic<std::uint64_t> oversize{0};
     Clock::time_point origin;
+    std::uint64_t originNs = 0;      // origin in master time: ns since the steady clock's epoch
+    double latency = 0.0;            // L, seconds from capture to the receivers' speakers
+    unsigned int sampleRate = 0;
     std::uint32_t session = 0;       // new for every run, so receivers can tell a restart from loss
-    std::uint32_t sequence = 0;      // audio thread only
     std::size_t bytesPerFrame = 0;
+
+    // Audio thread only.
+    std::uint32_t sequence = 0;
+    TimeFilter filter{};
+    bool settled = false;            // filter down from kStartBandwidth to kBandwidth
 };
+
+// Smoothed start time of this callback, in seconds since origin. The raw
+// callback times are bursty; every receiver steers toward the stamps, so they
+// have to lie on a smooth line.
+[[nodiscard]] static double trackCaptureClock(SenderContext& ctx, ma_uint32 frameCount) {
+    const double t = std::chrono::duration<double>(Clock::now() - ctx.origin).count();
+
+    // Also true on the first call. The filter assumes a fixed callback size,
+    // so a change starts it over, and a new session with it: receivers then
+    // re-align to the new timeline instead of following a jump in it.
+    if (frameCount != ctx.filter.framesPerPeriod()) {
+        if (ctx.filter.framesPerPeriod() != 0) {
+            ++ctx.session;
+        }
+        ctx.filter.configure(kStartBandwidth, frameCount, ctx.sampleRate);
+        ctx.filter.reset(t);
+        ctx.settled = false;
+        return ctx.filter.time();
+    }
+
+    ctx.filter.update(t);
+    if (!ctx.settled && static_cast<double>(ctx.filter.frame()) >= kStartSeconds * ctx.sampleRate) {
+        ctx.filter.configure(kBandwidth, frameCount, ctx.sampleRate);    // keeps the filter's state
+        ctx.settled = true;
+    }
+    return ctx.filter.time();
+}
 
 void data_callback(void* user, const void* input, ma_uint32 frameCount) {
     auto* ctx = static_cast<SenderContext*>(user);
- 
+
+    // First, so the timeline runs on through dropped packets.
+    const double captured = trackCaptureClock(*ctx, frameCount);
+
     const std::size_t payload = kAudioPacketHeaderBytes + frameCount * ctx->bytesPerFrame;
     if (payload > kMaxPayload) {
         ctx->oversize.fetch_add(1, std::memory_order_relaxed);
@@ -71,7 +129,7 @@ void data_callback(void* user, const void* input, ma_uint32 frameCount) {
         .session = ctx->session,
         .seq     = ctx->sequence++,
         .frames  = frameCount,
-        .t       = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()),
+        .t       = ctx->originNs + static_cast<std::uint64_t>(std::llround((captured + ctx->latency) * 1e9)),
     };
     std::uint8_t encoded[kAudioPacketHeaderBytes];
     streaming::encodeAudioPacketHeader(header, encoded);
@@ -84,7 +142,36 @@ void data_callback(void* user, const void* input, ma_uint32 frameCount) {
     ctx->wake.release();
 }
 
+struct Options {
+    std::string networkInterface;
+    double latencyMs = kDefaultLatencyMs;
+};
+
+// Returns an exit code if the program should end here (--help, bad input),
+// nothing if it should go on.
+std::optional<int> parseOptions(int argc, char** argv, Options& opts) {
+    CLI::App app{"Sender"};
+    argv = app.ensure_utf8(argv);
+
+    app.add_option("-n,--networkInterface", opts.networkInterface, "Network interface");
+    app.add_option("-L,--latency", opts.latencyMs,
+                   "Milliseconds from capture to the receivers' speakers, the same for every receiver")
+        ->check(CLI::PositiveNumber);
+
+    try {
+        app.parse(argc, argv);
+    } catch (const CLI::ParseError& e) {
+        return app.exit(e);
+    }
+    return std::nullopt;
+}
+
 int main(int argc, char** argv) {
+    Options opts;
+    if (const auto exitCode = parseOptions(argc, argv, opts)) {
+        return *exitCode;
+    }
+
     const auto all = net::enumerate();
     std::cout << "interfaces:\n";
     for (const auto& i : all) {
@@ -93,19 +180,36 @@ int main(int argc, char** argv) {
         if (!i.description.empty()) std::cout << "  (" << i.description << ")";
         std::cout << "\n";
     }
-    const auto chosen = argc > 1 ? net::find(argv[1]) : net::selectDefault();
+    const auto chosen = !opts.networkInterface.empty() ? net::find(opts.networkInterface) : net::selectDefault();
     if (!chosen) {
-        std::cerr << (argc > 1 ? "no such interface\n"
-                               : "ambiguous or none; name one explicitly\n");
+        std::cerr << (!opts.networkInterface.empty() ? "no such interface\n"
+                                                     : "ambiguous or none; name one explicitly\n");
         return 1;
     }
     std::cout << "using " << chosen->name << " " << chosen->address.to_string() << "\n";
 
-    const asio::ip::udp::endpoint group(asio::ip::make_address("239.255.0.1"), 12345);
+    const asio::ip::udp::endpoint group(asio::ip::make_address(kAudioGroup), kAudioPort);
     asio::io_context io;
     asio::ip::udp::socket tx(io);
     net::configureSender(tx, group, *chosen, {.hops = 1, .loopback = true});
     std::cout << "Sender configured\n";
+
+    // The sender is the clock-sync master: its steady clock is master time, so
+    // the stamps need no conversion. Binding the socket and joining the group
+    // throw on failure.
+    std::optional<clocksync::ClockSync> clockMaster;
+    try {
+        std::random_device rd;
+        clockMaster.emplace(clocksync::Config{
+            .group = asio::ip::udp::endpoint(asio::ip::make_address(kClockGroup), kClockPort),
+            .iface = *chosen,
+            .nodeId = (static_cast<std::uint64_t>(rd()) << 32) | rd(),
+        }, clocksync::Role::Master);
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to set up the clock-sync master: " << e.what() << "\n";
+        return 1;
+    }
+    std::cout << "clock-sync master on " << kClockGroup << ":" << kClockPort << "\n";
 
     AudioContext audio;
     if (!audio.init()) {
@@ -124,6 +228,8 @@ int main(int argc, char** argv) {
 
     SenderContext ctx;
     ctx.origin = Clock::now();
+    ctx.originNs = toNanos(ctx.origin);
+    ctx.latency = opts.latencyMs / 1000.0;
     ctx.session = std::random_device{}();
 
     AudioRecorder::Config recorderConfig;
@@ -152,8 +258,11 @@ int main(int argc, char** argv) {
     std::cout << "capture: " << recorder.channels() << " ch s16 @ " << recorder.sampleRate()
               << " Hz (run the receiver with -s " << recorder.sampleRate() << ")\n";
 
-    // The callback reads bytesPerFrame, so it has to be set before start().
+    std::cout << "latency " << opts.latencyMs << " ms\n";
+
+    // The callback reads these, so they have to be set before start().
     ctx.bytesPerFrame = recorder.bytesPerFrame();
+    ctx.sampleRate = recorder.sampleRate();
     if (kAudioPacketHeaderBytes + kPeriodSizeInFrames * ctx.bytesPerFrame > kMaxPayload) {
         std::cerr << "payload too large for slot\n";
         return 3;
@@ -189,6 +298,10 @@ int main(int argc, char** argv) {
         std::cerr << "Could not give the send thread real-time priority; it runs at normal priority\n";
     }
 
+    // Before the first stamp, so receivers can lock to master time while the
+    // capture device starts.
+    clockMaster->start();
+
     // Unlike the receiver, the worker has to exist before the device starts:
     // it is the consumer the callback hands slots to, so starting first would
     // drop the opening packets. That is what makes this failure path join.
@@ -207,6 +320,7 @@ int main(int argc, char** argv) {
     ctx.wake.release();
     worker.join();
     tx.close();
+    clockMaster->stop();
  
     std::cerr << "dropped " << ctx.dropped.load() << ", oversize " << ctx.oversize.load() <<  ", high water " << highWater << "\n";
     return 0;

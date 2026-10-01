@@ -16,10 +16,15 @@ namespace streaming {
 ///      9      4   seq        per-sender packet counter
 ///     13      4   frames     number of frames in the packet
 ///     17      8   t          presentation time of the first frame in ns
+///
+/// `t` is master time: the sender's steady clock, which is also the clock-sync
+/// master. It is when the packet's first frame should leave the receivers'
+/// speakers, the same moment for every receiver. Version 1 had the raw
+/// capture time here instead.
 
 inline constexpr std::size_t kAudioPacketHeaderBytes    = 25;
 inline constexpr std::uint32_t kAudioPacketHeaderMagic  = 0x50415544u;  // 'PAUD'
-inline constexpr std::uint8_t kAudioPacketHeaderVersion = 1;
+inline constexpr std::uint8_t kAudioPacketHeaderVersion = 2;
 
 struct AudioPacketHeader {
     std::uint8_t version    = kAudioPacketHeaderVersion;
