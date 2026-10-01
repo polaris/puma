@@ -531,7 +531,7 @@ TEST_CASE("frameAt finds a frame by position across the wrap", "[frame_ring]") {
     REQUIRE(ring->availableRead() == 8);
 }
 
-TEST_CASE("discardUntil releases frames up to a position", "[frame_ring]") {
+TEST_CASE("discard releases the next frames unread", "[frame_ring]") {
     constexpr std::size_t kBytesPerFrame = 2;
     auto ring = makeRing();
     REQUIRE(ring->init(kBytesPerFrame));
@@ -539,15 +539,14 @@ TEST_CASE("discardUntil releases frames up to a position", "[frame_ring]") {
     const std::vector<std::uint8_t> ten = makePattern(10, kBytesPerFrame, 0);
     REQUIRE(ring->write(ten.data(), 10));
 
-    REQUIRE(ring->discardUntil(4));
+    REQUIRE(ring->discard(4));
     REQUIRE(ring->readPosition() == 4);
     REQUIRE(ring->availableWrite() == ring->capacity() - 6);
 
-    REQUIRE(ring->discardUntil(4));             // where it already is: nothing to do
+    REQUIRE(ring->discard(0));                  // nothing to do
     REQUIRE(ring->readPosition() == 4);
 
-    REQUIRE_FALSE(ring->discardUntil(3));       // backwards
-    REQUIRE_FALSE(ring->discardUntil(11));      // past the write position
+    REQUIRE_FALSE(ring->discard(7));            // past the write position
     REQUIRE(ring->readPosition() == 4);
 
     // What follows is still intact.
@@ -555,7 +554,8 @@ TEST_CASE("discardUntil releases frames up to a position", "[frame_ring]") {
     REQUIRE(ring->read(out.data(), 6) == 6);
     REQUIRE(out == makePattern(6, kBytesPerFrame, 4 * kBytesPerFrame));
 
-    REQUIRE(ring->discardUntil(10));            // everything, up to the write position
+    REQUIRE(ring->write(ten.data(), 10));
+    REQUIRE(ring->discard(10));                 // everything, up to the write position
     REQUIRE(ring->availableRead() == 0);
 }
 

@@ -8,6 +8,8 @@ add_executable(puma_tests
     test_servo_additions.cpp
     test_frame_ring.cpp
     test_audio_packet.cpp
+    test_resampler.cpp
+    test_rate_loop.cpp
 )
 
 target_compile_features(puma_tests PRIVATE cxx_std_20)

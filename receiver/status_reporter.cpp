@@ -8,17 +8,19 @@
 
 #include <asio/post.hpp>
 
+#include "rate_loop.h"
 #include "terminal.h"
 
 StatusReporter::StatusReporter(asio::io_context& control, asio::io_context& receiveIo, SnapshotSource takeSnapshot,
-                               const PlaybackStats& playback, unsigned int nominalRate, std::size_t bytesPerFrame,
-                               Clock::time_point origin)
+                               const PlaybackStats& playback, unsigned int nominalRate, unsigned int deviceNominalRate,
+                               std::size_t bytesPerFrame, Clock::time_point origin)
 : control_{control}
 , receiveIo_{receiveIo}
 , timer_{control}
 , takeSnapshot_{std::move(takeSnapshot)}
 , playback_{playback}
 , nominalRate_{nominalRate}
+, deviceNominalRate_{deviceNominalRate}
 , bytesPerFrame_{bytesPerFrame}
 , origin_{origin}
 , interactive_{term::isTerminal(stderr)} {
@@ -114,7 +116,8 @@ std::string StatusReporter::statusLine(const ReceiverSnapshot& snapshot) const {
 
     line << "  drift ";
     if (senderRate > 0.0 && deviceRate > 0.0) {
-        appendPpm(line, senderRate / deviceRate);
+        const double nominalRatio = static_cast<double>(nominalRate_) / deviceNominalRate_;
+        appendPpm(line, senderRate / deviceRate / nominalRatio);
     } else {
         line << "--";
     }
@@ -130,10 +133,13 @@ std::string StatusReporter::statusLine(const ReceiverSnapshot& snapshot) const {
     line << "  headroom ";
     if (const std::int64_t headroom = playback_.headroom.load(std::memory_order_relaxed);
         headroom != PlaybackStats::kHeadroomUnknown) {
-        line << headroom << '/' << playback_.targetHeadroom.load(std::memory_order_relaxed);
+        line << headroom << '/' << playback_.margin.load(std::memory_order_relaxed)
+             << " (max used " << playback_.maxMarginUsed.load(std::memory_order_relaxed) << ')';
     } else {
         line << "--";
     }
+
+    appendLoop(line);
 
     line << "  ring ";
     if (window.packets > 0) {
@@ -158,20 +164,37 @@ std::string StatusReporter::statusLine(const ReceiverSnapshot& snapshot) const {
 
     // Last, so a narrow terminal cuts the details rather than the above.
     line << "  sender ";
-    appendRate(line, senderRate);
+    appendRate(line, senderRate, nominalRate_);
     line << "  device ";
-    appendRate(line, deviceRate);
+    appendRate(line, deviceRate, deviceNominalRate_);
 
     return line.str();
 }
 
-void StatusReporter::appendRate(std::ostringstream& line, double rate) const {
+// The rate loop's correction should settle on the drift; its error, in
+// frames, near zero.
+void StatusReporter::appendLoop(std::ostringstream& line) const {
+    line << "  loop ";
+    const auto phase = static_cast<RateLoop::Phase>(playback_.loopPhase.load(std::memory_order_relaxed));
+    if (phase == RateLoop::Phase::Waiting) {
+        line << "--";
+        return;
+    }
+    appendPpm(line, 1.0 + playback_.correction.load(std::memory_order_relaxed));
+    line << " err " << std::showpos << std::setprecision(1)
+         << playback_.delayError.load(std::memory_order_relaxed) << std::noshowpos;
+    if (phase == RateLoop::Phase::Settling) {
+        line << " settling";
+    }
+}
+
+void StatusReporter::appendRate(std::ostringstream& line, double rate, unsigned int nominal) {
     if (rate <= 0.0) {
         line << "--";
         return;
     }
     line << std::setprecision(2) << rate << " Hz (";
-    appendPpm(line, rate / nominalRate_);
+    appendPpm(line, rate / nominal);
     line << ')';
 }
 

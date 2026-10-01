@@ -24,7 +24,10 @@
 #include "audio_packet.h"
 #include "audio_player.h"
 #include "netint.h"
+#include "rate_loop.h"
 #include "receive_stats.h"
+#include "resampler.h"
+#include "spsc_ring.h"
 #include "status_reporter.h"
 #include "thread_priority.h"
 #include "time_filter.h"
@@ -41,40 +44,41 @@ constexpr unsigned int kPeriodSizeInFrames = 240;
 constexpr unsigned int kNumPeriods = 3;
 using streaming::kAudioPacketHeaderBytes;
 
-constexpr std::size_t kRingFrames = 2048;
+// Room for the rate loop's whole target (a callback's read, a packet, the
+// resampler's share and the margin) plus the jitter above it: ~170 ms.
+constexpr std::size_t kRingFrames = 8192;
 using Ring = FrameRing<kRingFrames>;
-constexpr std::size_t kMaxChannels = 8;         // FrameRing takes up to 16 bytes per frame
 
-constexpr double kDefaultBufferMarginMs = 3.0;
-constexpr std::int64_t kMinTrimFrames = 48;     // hysteresis: smaller excesses are left alone
-constexpr std::size_t kCrossfadeFrames = 64;
-constexpr std::size_t kMaxHeadroom = kRingFrames / 2;
-constexpr unsigned int kHeadroomDecaySeconds = 60;  // without underruns, before the target steps down
+// Network thread -> audio thread: one (t, k) point per packet for the rate loop.
+using ReportQueue = SpscRing<NetReport, 64>;
+
+// Fixed, so the delay stays the same for the whole run: generous rather than
+// tight, since underruns matter more here than latency.
+constexpr double kDefaultBufferMarginMs = 20.0;
+constexpr std::size_t kMaxMargin = kRingFrames / 4;   // leaves most of the ring for jitter above the target
 
 // CPU the receive thread needs per packet, at most; for the real-time scheduler.
 constexpr auto kReceiveComputation = std::chrono::microseconds(500);
 
 struct PlaybackState {
-    unsigned int sampleRate = 0;
+    unsigned int deviceRate = 0;
     std::size_t bytesPerFrame = 0;
-    std::size_t minHeadroom = 0;        // floor of the target: frames left in the ring after a read, at the lowest point
-    std::size_t trimWindowFrames = 0;   // how long to watch the lowest point before acting on it
-    std::size_t decayFrames = 0;        // how long without underruns before the target steps down
+    std::size_t margin = 0;             // the rate loop's, in sender frames
+    std::size_t headroomWindowFrames = 0;   // how long to watch the lowest headroom before reporting it
 
     Ring* ring = nullptr;
+    ReportQueue* reports = nullptr;
     PlaybackStats* stats = nullptr;
 
     std::chrono::steady_clock::time_point origin;
 
     // Audio thread only.
     TimeFilter timeFilter{};
-    bool primed = false;
-    std::size_t targetHeadroom = 0;     // starts at minHeadroom, rises with underruns, decays back
-    std::size_t framesSinceRaise = 0;
+    RateLoop loop{};
+    Resampler resampler{};
+    std::int64_t maxMarginUsed = 0;
     std::int64_t windowMinHeadroom = std::numeric_limits<std::int64_t>::max();
-    std::int64_t windowMaxHeadroom = std::numeric_limits<std::int64_t>::min();
     std::size_t windowFrames = 0;
-    std::array<std::int16_t, kRingFrames * kMaxChannels> scratch{};     // for trimmed reads
 };
 
 void printReceiveStats(const ReceiveStats& stats, const PlaybackStats& playback) {
@@ -95,128 +99,117 @@ void printReceiveStats(const ReceiveStats& stats, const PlaybackStats& playback)
 
 }
 
-static void trackDeviceClock(PlaybackState& s, ma_uint32 frameCount) {
+[[nodiscard]] static double trackDeviceClock(PlaybackState& s, ma_uint32 frameCount) {
     const auto t = std::chrono::duration<double>(Clock::now() - s.origin).count();
     // Also true on the first call. miniaudio does not promise a fixed callback
     // size, and the filter assumes one, so it starts over when the size changes.
     if (frameCount != s.timeFilter.framesPerPeriod()) {
-        s.timeFilter.configure(kBandwidth, frameCount, s.sampleRate);
+        s.timeFilter.configure(kBandwidth, frameCount, s.deviceRate);
         s.timeFilter.reset(t);
+        s.loop.setFramesPerCallback(frameCount);
     } else {
         s.timeFilter.update(t);
         s.stats->deviceRate.store(s.timeFilter.rate(), std::memory_order_relaxed);
     }
+    return s.timeFilter.time();
 }
 
-// Follows the headroom over a window and acts on it at the end of each one:
-//  - every read in the window came up short: the stream stopped, not jitter,
-//    so prime again rather than learn from it;
-//  - some reads came up short: the target was too low for this network, so
-//    raise it by the worst shortfall (the underrun already added the frames);
-//  - none did: after a long quiet spell, let the target step down, and trim
-//    whatever sits above it.
-// Returns the frames to trim now, never more than the ring holds beyond
-// `frameCount`: the lowest point is no higher than the current one.
-static std::size_t adaptBuffer(PlaybackState& s, std::size_t fill, std::size_t frameCount) {
-    const auto headroom = static_cast<std::int64_t>(fill) - static_cast<std::int64_t>(frameCount);
+// The ring ran dry: start over. The loop waits until the ring holds its
+// target again, which also covers a sender that stopped.
+static void onUnderrun(PlaybackState& s, ma_uint32 frameCount) {
+    s.loop.restart();
+    s.resampler.reset();
+    s.stats->underrunFrames.fetch_add(frameCount, std::memory_order_relaxed);
+}
+
+// How much of the margin the jitter used at most, while running: what the
+// margin needs to be, measured rather than guessed. Beyond the margin when
+// the ring ran dry.
+static void trackMarginUsed(PlaybackState& s, std::int64_t headroom) {
+    if (s.loop.phase() != RateLoop::Phase::Running) {
+        return;     // the start is the loop's transient, not jitter
+    }
+    const std::int64_t used = static_cast<std::int64_t>(s.margin) - headroom;
+    if (used > s.maxMarginUsed) {
+        s.maxMarginUsed = used;
+        s.stats->maxMarginUsed.store(used, std::memory_order_relaxed);
+    }
+}
+
+// Lowest headroom (ring fill beyond what a read takes) over a window, for the status line.
+static void trackHeadroom(PlaybackState& s, std::int64_t headroom, ma_uint32 frameCount) {
     s.windowMinHeadroom = std::min(s.windowMinHeadroom, headroom);
-    s.windowMaxHeadroom = std::max(s.windowMaxHeadroom, headroom);
     s.windowFrames += frameCount;
-    if (s.windowFrames < s.trimWindowFrames) {
-        return 0;
-    }
-
-    const std::int64_t lowest = s.windowMinHeadroom;
-    const std::int64_t highest = s.windowMaxHeadroom;
-    s.windowMinHeadroom = std::numeric_limits<std::int64_t>::max();
-    s.windowMaxHeadroom = std::numeric_limits<std::int64_t>::min();
-    s.windowFrames = 0;
-    s.stats->headroom.store(lowest, std::memory_order_relaxed);
-
-    std::size_t excess = 0;
-    if (highest < 0) {
-        s.primed = false;
-        s.stats->headroom.store(PlaybackStats::kHeadroomUnknown, std::memory_order_relaxed);
-    } else if (lowest < 0) {
-        s.targetHeadroom = std::min(s.targetHeadroom + static_cast<std::size_t>(-lowest), kMaxHeadroom);
-        s.framesSinceRaise = 0;
-    } else {
-        s.framesSinceRaise += s.trimWindowFrames;
-        if (s.framesSinceRaise >= s.decayFrames && s.targetHeadroom > s.minHeadroom) {
-            const auto step = static_cast<std::size_t>(kMinTrimFrames);
-            s.targetHeadroom = s.targetHeadroom > s.minHeadroom + step ? s.targetHeadroom - step : s.minHeadroom;
-            s.framesSinceRaise = 0;
-        }
-        const std::int64_t above = lowest - static_cast<std::int64_t>(s.targetHeadroom);
-        if (above >= kMinTrimFrames) {
-            excess = static_cast<std::size_t>(above);
-        }
-    }
-    s.stats->targetHeadroom.store(s.targetHeadroom, std::memory_order_relaxed);
-    return excess;
-}
-
-// Drops `excess` frames from the front of the ring and plays what follows,
-// crossfading from the dropped frames into the kept ones so the jump does not
-// click. The ring holds at least frameCount + excess frames.
-static void playTrimmed(PlaybackState& s, std::int16_t* out, std::size_t frameCount, std::size_t excess) {
-    const std::size_t channels = s.bytesPerFrame / sizeof(std::int16_t);
-    // All of them: only this thread reads, so the fill can only have grown.
-    (void)s.ring->read(s.scratch.data(), frameCount + excess);
-
-    const std::int16_t* dropped = s.scratch.data();
-    const std::int16_t* kept = s.scratch.data() + excess * channels;
-    const std::size_t fade = std::min(kCrossfadeFrames, frameCount);
-    for (std::size_t i = 0; i < fade; ++i) {
-        const float w = static_cast<float>(i + 1) / static_cast<float>(fade + 1);
-        for (std::size_t c = 0; c < channels; ++c) {
-            const std::size_t k = i * channels + c;
-            out[k] = static_cast<std::int16_t>(std::lrint(dropped[k] * (1.0f - w) + kept[k] * w));
-        }
-    }
-    std::memcpy(out + fade * channels, kept + fade * channels, (frameCount - fade) * s.bytesPerFrame);
-
-    s.stats->trimmedFrames.fetch_add(excess, std::memory_order_relaxed);
-}
-
-static void playFromRing(PlaybackState& s, std::uint8_t* out, std::size_t frameCount) {
-    const std::size_t got = s.ring->read(out, frameCount);
-    if (got < frameCount) {
-        const std::size_t short_ = frameCount - got;
-        std::memset(out + got * s.bytesPerFrame, 0, short_ * s.bytesPerFrame);
-        s.stats->underrunFrames.fetch_add(short_, std::memory_order_relaxed);
+    if (s.windowFrames >= s.headroomWindowFrames) {
+        s.stats->headroom.store(s.windowMinHeadroom, std::memory_order_relaxed);
+        s.windowMinHeadroom = std::numeric_limits<std::int64_t>::max();
+        s.windowFrames = 0;
     }
 }
 
+static void publishLoop(const PlaybackState& s) {
+    s.stats->loopPhase.store(static_cast<int>(s.loop.phase()), std::memory_order_relaxed);
+    s.stats->correction.store(s.loop.correction(), std::memory_order_relaxed);
+    s.stats->delayError.store(s.loop.error(), std::memory_order_relaxed);
+}
+
+static void playSilence(const PlaybackState& s, void* output, ma_uint32 frameCount) {
+    std::memset(output, 0, frameCount * s.bytesPerFrame);
+}
+
+// The rate loop's D side (see rate_loop.h): every callback measures the delay
+// error at its smoothed start time, steers the resampling ratio from it, and
+// then reads exactly what the resampler needs for this callback.
 static void onPlayback(void* user, void* output, ma_uint32 frameCount) {
-    auto* const s = static_cast<PlaybackState*>(user);
-    trackDeviceClock(*s, frameCount);
+    auto& s = *static_cast<PlaybackState*>(user);
+    const double t = trackDeviceClock(s, frameCount);
 
-    const std::size_t fill = s->ring->availableRead();
-
-    // Silence until the ring holds a read plus the target; from then on,
-    // underruns and trims keep it near that.
-    if (!s->primed) {
-        if (fill < frameCount + s->targetHeadroom) {
-            std::memset(output, 0, frameCount * s->bytesPerFrame);
-            return;
-        }
-        s->primed = true;
+    for (NetReport report; s.reports->pop(report); ) {
+        s.loop.addReport(report);
     }
 
-    if (const std::size_t excess = adaptBuffer(*s, fill, frameCount); excess > 0) {
-        playTrimmed(*s, static_cast<std::int16_t*>(output), frameCount, excess);
-    } else {
-        playFromRing(*s, static_cast<std::uint8_t*>(output), frameCount);
+    const auto step = s.loop.update(t, s.ring->readPosition(), s.resampler.inputDistance(), s.ring->availableRead());
+    publishLoop(s);
+    if (!step.play) {
+        s.resampler.reset();
+        s.stats->headroom.store(PlaybackStats::kHeadroomUnknown, std::memory_order_relaxed);
+        playSilence(s, output, frameCount);
+        return;
     }
+
+    if (step.trim > 0) {
+        // Only this thread reads, so the fill can only have grown since.
+        (void)s.ring->discard(step.trim);
+        s.stats->trimmedFrames.fetch_add(step.trim, std::memory_order_relaxed);
+    }
+
+    s.resampler.setRatio(step.ratio);
+    const std::size_t need = s.resampler.inputFor(frameCount);
+    const std::size_t fill = s.ring->availableRead();
+    const std::int64_t headroom = static_cast<std::int64_t>(fill) - static_cast<std::int64_t>(need);
+    trackHeadroom(s, headroom, frameCount);
+    trackMarginUsed(s, headroom);
+    if (need > fill) {
+        onUnderrun(s, frameCount);
+        playSilence(s, output, frameCount);
+        return;
+    }
+
+    // Resampled in place: the producer cannot reuse the slots before the commit.
+    const Regions in = s.ring->acquireRead(need);
+    s.resampler.process(reinterpret_cast<const std::int16_t*>(in.region1().buf), in.region1().len,
+                        reinterpret_cast<const std::int16_t*>(in.region2().buf), in.region2().len,
+                        static_cast<std::int16_t*>(output), frameCount);
+    (void)s.ring->commitRead(need);
 }
 
 class PacketReceiver {
 public:
-    PacketReceiver(udp::socket& rx, Ring& ring, ReceiveStats& stats, std::size_t bytesPerFrame,
-                   unsigned int sampleRate, Clock::time_point origin)
+    PacketReceiver(udp::socket& rx, Ring& ring, ReportQueue& reports, ReceiveStats& stats,
+                   std::size_t bytesPerFrame, unsigned int sampleRate, Clock::time_point origin)
     : rx_{rx}
     , ring_{ring}
+    , reports_{reports}
     , stats_{stats}
     , bytesPerFrame_{bytesPerFrame}
     , sampleRate_{sampleRate}
@@ -277,8 +270,8 @@ private:
         }
         const streaming::AudioPacketHeader& header = *decoded;
 
-        if (discard_ > 0) {
-            --discard_;
+        if (warmupPackets_ > 0) {
+            --warmupPackets_;
             session_ = header.session;
             expectedSeq_ = header.seq + 1;
             arm();
@@ -291,7 +284,7 @@ private:
             ++stats_.sessionChanges;
             session_ = header.session;
             expectedSeq_ = header.seq;
-            filter_.invalidate();
+            lostTrack();
         }
 
         const std::uint32_t gap = header.seq - expectedSeq_;
@@ -306,6 +299,21 @@ private:
 
         window_.addFill(ring_.availableRead());
         trackTiming(arrival, header.frames);
+        report();
+    }
+
+    // The timing starts over, and with it the rate loop, which is fed from it.
+    void lostTrack() {
+        filter_.invalidate();
+        restartPending_ = true;
+    }
+
+    // The rate loop's N side (see rate_loop.h): when the next packet is due,
+    // and where the ring's write position will be once it is in.
+    void report() {
+        if (reports_.push({filter_.nextTime(), ring_.writePosition() + filter_.framesPerPeriod(), restartPending_})) {
+            restartPending_ = false;
+        }
     }
 
     void concealGap(std::uint32_t gap, std::uint32_t frames) {
@@ -314,7 +322,7 @@ private:
 
         if (missing > kRingFrames) {
             ++stats_.resyncs;
-            filter_.invalidate();
+            lostTrack();
             return;
         }
 
@@ -344,7 +352,7 @@ private:
                 ++stats_.frameCountChanges;
             }
             filter_.configure(kBandwidth, frames, sampleRate_);
-            filter_.invalidate();
+            lostTrack();
         }
 
         if (!filter_.ready()) {
@@ -358,13 +366,15 @@ private:
 
     udp::socket& rx_;
     Ring& ring_;
+    ReportQueue& reports_;
     ReceiveStats& stats_;
     const std::size_t bytesPerFrame_;
     const unsigned int sampleRate_;
     const Clock::time_point origin_;
 
     TimeFilter filter_;
-    int discard_ = 10;
+    bool restartPending_ = false;
+    int warmupPackets_ = 10;
     std::uint32_t session_ = 0;
     std::uint32_t expectedSeq_ = 0;
     bool stopping_ = false;
@@ -429,7 +439,7 @@ std::optional<int> parseOptions(int argc, char** argv, const AudioContext& audio
     app.add_option("-f,--periodSizeInFrames", opts.periodSizeInFrames, "Period size in frames")
         ->check(CLI::PositiveNumber);
     app.add_option("-b,--bufferMargin", opts.bufferMarginMs,
-                   "Least receive buffer kept in reserve against jitter, in milliseconds; grows after underruns")
+                   "Receive buffer kept in reserve against network jitter, in milliseconds; fixed for the run")
         ->check(CLI::NonNegativeNumber);
     app.add_option("-n,--networkInterface", opts.networkInterface, "Network interface");
     app.add_option("-m,--multicastGroup", opts.multicastGroup, "Multicast group address")
@@ -498,33 +508,33 @@ int main(int argc, char** argv) {
     AudioPlayer::Config playerConfig {
         .format = ma_format_s16,
         .channels = 0,     // native
-        .sampleRate = opts.senderSampleRate,
+        .sampleRate = 0,   // native: the rate loop's resampler converts, not miniaudio's
         .periodSizeInFrames = opts.periodSizeInFrames,
         .periods = kNumPeriods,
     };
 
     Ring frameRing;
+    ReportQueue reports;
     ReceiveStats stats;
     PlaybackStats playbackStats;
 
     const auto origin  = Clock::now();
 
-    const auto minHeadroom = static_cast<std::size_t>(
+    // In sender frames: it is kept in the ring, ahead of the resampler.
+    const auto margin = static_cast<std::size_t>(
         std::lround(opts.bufferMarginMs * opts.senderSampleRate / 1000.0));
-    if (minHeadroom > kMaxHeadroom) {
+    if (margin > kMaxMargin) {
         std::cerr << "Buffer margin of " << opts.bufferMarginMs << " ms does not fit the "
-                  << kMaxHeadroom << " frame limit\n";
+                  << kMaxMargin << " frame limit\n";
         return 2;
     }
 
     PlaybackState state{
-        .sampleRate = opts.senderSampleRate,
-        .minHeadroom = minHeadroom,
-        .trimWindowFrames = opts.senderSampleRate,      // one second
-        .decayFrames = kHeadroomDecaySeconds * opts.senderSampleRate,
+        .margin = margin,
+        .ring = &frameRing,
+        .reports = &reports,
         .stats = &playbackStats,
         .origin = origin,
-        .targetHeadroom = minHeadroom,
     };
 
     AudioPlayer player;
@@ -532,13 +542,11 @@ int main(int argc, char** argv) {
         std::cerr << "Failed to open the selected output device\n";
         return 2;
     }
-    if (player.internalSampleRate() != opts.senderSampleRate) {
-        std::cerr << "Output device runs at " << player.internalSampleRate()
-                  << " Hz, but the sender uses " << opts.senderSampleRate << " Hz\n";
-        return 2;
-    }
-    std::cout << "playback: " << player.channels() << " ch s16 @ " << player.sampleRate() << " Hz, "
-              << "buffer margin " << minHeadroom << " frames (" << opts.bufferMarginMs << " ms)\n";
+    const unsigned int deviceRate = player.sampleRate();
+    const double nominalRatio = static_cast<double>(opts.senderSampleRate) / deviceRate;
+    std::cout << "playback: " << player.channels() << " ch s16 @ " << deviceRate << " Hz, "
+              << "sender @ " << opts.senderSampleRate << " Hz, "
+              << "buffer margin " << margin << " frames (" << opts.bufferMarginMs << " ms)\n";
 
     // Everything the audio callback touches has to be in place before start().
     const std::size_t bytesPerFrame = player.bytesPerFrame();
@@ -546,15 +554,25 @@ int main(int argc, char** argv) {
         std::cerr << "Unsupported frame size: " << bytesPerFrame << " bytes\n";
         return 2;
     }
-    state.ring = &frameRing;
+    state.deviceRate = deviceRate;
     state.bytesPerFrame = bytesPerFrame;
+    state.headroomWindowFrames = deviceRate;    // one second
+    state.resampler.configure(player.channels(), nominalRatio);
+    state.loop.configure({
+        .nominalRatio = nominalRatio,
+        .deviceRate = static_cast<double>(deviceRate),
+        .framesPerCallback = opts.periodSizeInFrames,
+        .resamplerDelay = static_cast<double>(state.resampler.halfLength()),
+        .margin = static_cast<double>(margin),
+    });
+    playbackStats.margin.store(margin, std::memory_order_relaxed);
 
-    PacketReceiver receiver(rx, frameRing, stats, bytesPerFrame, opts.senderSampleRate, origin);
+    PacketReceiver receiver(rx, frameRing, reports, stats, bytesPerFrame, opts.senderSampleRate, origin);
 
     // The main thread only reports and waits for signals; packets never wait for it.
     asio::io_context control;
     StatusReporter reporter(control, io, [&receiver]{ return receiver.takeSnapshot(); }, playbackStats,
-                            opts.senderSampleRate, bytesPerFrame, origin);
+                            opts.senderSampleRate, deviceRate, bytesPerFrame, origin);
 
     if (!player.start()) {
         std::cerr << "Failed to start the playback device\n";

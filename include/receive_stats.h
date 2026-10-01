@@ -35,16 +35,25 @@ struct ReceiveStats {
 struct alignas(128) PlaybackStats {
     static constexpr std::int64_t kHeadroomUnknown = std::numeric_limits<std::int64_t>::min();
 
-    std::atomic<std::uint64_t> underrunFrames{0};
-    std::atomic<std::uint64_t> trimmedFrames{0};
-    // Lowest (ring fill before a read - frames read) over the last trim window.
-    // Negative when that window underran; kHeadroomUnknown until primed.
+    std::atomic<std::uint64_t> underrunFrames{0};   // output frames played as silence after running dry
+    std::atomic<std::uint64_t> trimmedFrames{0};    // discarded from the ring to reach the target delay
+    // Lowest (ring fill - what the next read takes) over the last second.
+    // Negative when that second underran; kHeadroomUnknown until playing.
     std::atomic<std::int64_t> headroom{kHeadroomUnknown};
-    std::atomic<std::uint64_t> targetHeadroom{0};    // what trimming currently keeps; adapts to underruns
+    std::atomic<std::uint64_t> margin{0};           // the rate loop's, fixed
+    // Most of the margin the jitter used at any read while running, so far:
+    // what the margin needs to be. Beyond the margin when the ring ran dry.
+    std::atomic<std::int64_t> maxMarginUsed{0};
     std::atomic<double> deviceRate{0.0};    // frames per second of steady_clock time; 0 until known
+
+    // The rate loop, after each callback.
+    std::atomic<int> loopPhase{0};          // RateLoop::Phase
+    std::atomic<double> correction{0.0};    // of the resampling ratio, relative to nominal
+    std::atomic<double> delayError{0.0};    // frames
 };
 static_assert(std::atomic<std::int64_t>::is_always_lock_free);
 static_assert(std::atomic<double>::is_always_lock_free);
+static_assert(std::atomic<int>::is_always_lock_free);
 
 // Figures for one reporting interval, gathered per packet.
 struct ReceiveWindow {

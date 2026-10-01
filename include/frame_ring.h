@@ -209,14 +209,10 @@ public:
         return read_.load(std::memory_order_acquire);
     }
 
-    // Hands every frame before `pos` back to the producer. Consumer side only.
-    // Refuses to move backwards or past the write position.
-    [[nodiscard]] bool discardUntil(std::uint64_t pos) {
-        const std::size_t r = read_.load(std::memory_order_relaxed);
-        if (pos < r) {
-            return false;
-        }
-        return commitRead(static_cast<std::size_t>(pos) - r);
+    // Hands the next `frames` frames back to the producer, unread. Consumer
+    // side only. Refuses to move past the write position.
+    [[nodiscard]] bool discard(std::size_t frames) {
+        return commitRead(frames);
     }
 
 private:

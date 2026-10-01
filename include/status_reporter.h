@@ -30,8 +30,8 @@ public:
     // `takeSnapshot` is called on the thread running `receiveIo`, and is
     // expected to start a new ReceiveWindow each time.
     StatusReporter(asio::io_context& control, asio::io_context& receiveIo, SnapshotSource takeSnapshot,
-                   const PlaybackStats& playback, unsigned int nominalRate, std::size_t bytesPerFrame,
-                   Clock::time_point origin);
+                   const PlaybackStats& playback, unsigned int nominalRate, unsigned int deviceNominalRate,
+                   std::size_t bytesPerFrame, Clock::time_point origin);
 
     StatusReporter(const StatusReporter&) = delete;
     StatusReporter& operator=(const StatusReporter&) = delete;
@@ -49,7 +49,8 @@ private:
     void reportEvents(const ReceiverSnapshot& snapshot);
     [[nodiscard]] std::string statusLine(const ReceiverSnapshot& snapshot) const;
 
-    void appendRate(std::ostringstream& line, double rate) const;
+    void appendLoop(std::ostringstream& line) const;
+    static void appendRate(std::ostringstream& line, double rate, unsigned int nominal);
     static void appendPpm(std::ostringstream& line, double ratio);
     static void appendIfAny(std::ostringstream& line, const char* label, std::uint64_t count);
 
@@ -62,7 +63,8 @@ private:
     Clock::time_point next_;
     const SnapshotSource takeSnapshot_;
     const PlaybackStats& playback_;
-    const unsigned int nominalRate_;
+    const unsigned int nominalRate_;        // the sender's
+    const unsigned int deviceNominalRate_;
     const std::size_t bytesPerFrame_;
     const Clock::time_point origin_;
     const bool interactive_;
