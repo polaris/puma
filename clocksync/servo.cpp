@@ -68,7 +68,7 @@ void Servo::addSample(double localSeconds, double masterSeconds,
         if (seedCount_ < seeds_.size()) return;
         const auto& best = *std::min_element(seeds_.begin(), seeds_.end(),
             [](const Seed& x, const Seed& y) { return x.delay < y.delay; });
-        current_ = ClockMapping{.localRef = best.L, .masterRef = best.M, .skew = 0.0};
+        current_ = ClockMapping{.localRef = best.L, .masterRef = best.M, .skew = 0.0, .generation = ++generations_};
         acquireStart_ = localSeconds;
         state_.value  = State::Acquiring;
         return;

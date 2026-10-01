@@ -13,6 +13,10 @@ struct ClockMapping {
     double localRef;     // a local steady_clock instant, seconds
     double masterRef;    // the master time at that instant
     double skew;         // master seconds per local second, minus 1
+    // New for every fresh estimate, after a reset and the seeding that follows
+    // it. Within one generation the mapping moves in small steps only; across
+    // a change it may jump.
+    std::uint32_t generation = 0;
 };
 
 struct State {
@@ -106,6 +110,7 @@ private:
     // bookkeeping
     std::uint64_t accepted_ = 0, rejected_ = 0, tooSoon_ = 0;
     int consecutiveLarge_ = 0;
+    std::uint32_t generations_ = 0;     // not reset: it numbers the estimates
 };
 
 [[nodiscard]] double localToMaster(double local, const ClockMapping& mapping) noexcept;

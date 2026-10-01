@@ -229,3 +229,25 @@ TEST_CASE("reset clears the mapping, the delay window and the counters", "[servo
     REQUIRE(servo.pathDelay() == std::chrono::nanoseconds{0});
     REQUIRE(servo.gateThreshold() == std::chrono::nanoseconds::max());
 }
+
+TEST_CASE("each fresh estimate gets a new generation", "[servo]") {
+    Servo servo;
+    double local = seed(servo);
+    const std::uint32_t first = servo.mapping()->generation;
+    REQUIRE(first != 0);
+
+    // Updates within an estimate keep it.
+    for (int i = 0; i < 20; ++i) {
+        servo.addSample(local, masterAt(local), 1ms);
+        local += kInterval;
+    }
+    REQUIRE(servo.mapping()->generation == first);
+
+    // A reset and the seeding after it start the next one.
+    servo.reset();
+    for (int i = 0; i < 8; ++i) {
+        servo.addSample(local, masterAt(local), 1ms);
+        local += kInterval;
+    }
+    REQUIRE(servo.mapping()->generation == first + 1);
+}

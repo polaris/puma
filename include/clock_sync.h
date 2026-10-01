@@ -127,6 +127,7 @@ private:
 
     std::atomic<std::size_t> seq_;
     std::atomic<double> localRef_, masterRef_, skew_;
+    std::atomic<std::uint32_t> generation_{0};
 
     asio::ip::udp::endpoint remote_;
     std::array<std::uint8_t, 64> buffer_;
@@ -183,7 +184,7 @@ private:
     void armDelayReqTimer();
     void sendDelayReq();
 
-    void updateMapping(double localRef, double masterRef, double skew);
+    void updateMapping(const ClockMapping& mapping);
     void publishStats();          // io thread -> the atomics above
     void reportStampMode();       // one-shot, once probation has settled
 };

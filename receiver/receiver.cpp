@@ -10,7 +10,9 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <random>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <CLI/CLI.hpp>
@@ -23,7 +25,9 @@
 #include "audio_context.h"
 #include "audio_packet.h"
 #include "audio_player.h"
+#include "clock_sync.h"
 #include "netint.h"
+#include "presentation_timeline.h"
 #include "rate_loop.h"
 #include "receive_stats.h"
 #include "resampler.h"
@@ -36,7 +40,11 @@
 using asio::ip::udp;
 using Clock = std::chrono::steady_clock;
 
-constexpr double kBandwidth = 0.05;
+// The device's and the arrivals' smoothing: fast for the first seconds after
+// a (re)start, so start-up bursts settle quickly, then slow.
+constexpr double kBandwidth = 0.05;        // Hz
+constexpr double kStartBandwidth = 1.0;    // Hz
+constexpr double kStartSeconds = 4.0;
 constexpr std::string_view kDefaultMulticastGroup = "239.255.0.1";
 constexpr unsigned short kDefaultMulticastPort = 12345;
 constexpr unsigned int kDefaultSampleRate = 48000;
@@ -44,18 +52,24 @@ constexpr unsigned int kPeriodSizeInFrames = 240;
 constexpr unsigned int kNumPeriods = 3;
 using streaming::kAudioPacketHeaderBytes;
 
-// Room for the rate loop's whole target (a callback's read, a packet, the
-// resampler's share and the margin) plus the jitter above it: ~170 ms.
+// Frames wait here from arrival until their presentation time, about the
+// sender's latency L: ~170 ms, enough for L up to about 150 ms.
 constexpr std::size_t kRingFrames = 8192;
 using Ring = FrameRing<kRingFrames>;
 
-// Network thread -> audio thread: one (t, k) point per packet for the rate loop.
+// Network thread -> audio thread: one (t, k) point per packet for the timeline.
 using ReportQueue = SpscRing<NetReport, 64>;
 
-// Fixed, so the delay stays the same for the whole run: generous rather than
-// tight, since underruns matter more here than latency.
-constexpr double kDefaultBufferMarginMs = 20.0;
-constexpr std::size_t kMaxMargin = kRingFrames / 4;   // leaves most of the ring for jitter above the target
+// From the start of a callback to its sound leaving the speaker. Differs per
+// device, driver and buffer setting, and miniaudio does not report it
+// reliably: measure it, and pass it per receiver.
+constexpr double kDefaultOutputLatencyMs = 0.0;
+
+// Further off than this, the receiver re-aligns instead of steering back.
+constexpr double kRealignMs = 5.0;
+
+constexpr std::string_view kClockGroup = "239.255.0.2";    // the sender is the master
+constexpr unsigned short kClockPort = 12346;
 
 // CPU the receive thread needs per packet, at most; for the real-time scheduler.
 constexpr auto kReceiveComputation = std::chrono::microseconds(500);
@@ -63,20 +77,23 @@ constexpr auto kReceiveComputation = std::chrono::microseconds(500);
 struct PlaybackState {
     unsigned int deviceRate = 0;
     std::size_t bytesPerFrame = 0;
-    std::size_t margin = 0;             // the rate loop's, in sender frames
     std::size_t headroomWindowFrames = 0;   // how long to watch the lowest headroom before reporting it
+    double outputLatency = 0.0;         // seconds, callback start to speaker
 
     Ring* ring = nullptr;
     ReportQueue* reports = nullptr;
     PlaybackStats* stats = nullptr;
+    const clocksync::ClockSync* clock = nullptr;
 
     std::chrono::steady_clock::time_point origin;
+    double originSeconds = 0.0;         // origin as clocksync's local time: seconds since the steady epoch
 
     // Audio thread only.
     TimeFilter timeFilter{};
+    PresentationTimeline timeline{};
+    std::optional<ClockMapping> mapping;    // the last one read
     RateLoop loop{};
     Resampler resampler{};
-    std::int64_t maxMarginUsed = 0;
     std::int64_t windowMinHeadroom = std::numeric_limits<std::int64_t>::max();
     std::size_t windowFrames = 0;
 };
@@ -95,6 +112,9 @@ void printReceiveStats(const ReceiveStats& stats, const PlaybackStats& playback)
               << ", frame count changes " << stats.frameCountChanges
               << ", underrun frames " << playback.underrunFrames.load()
               << ", trimmed frames " << playback.trimmedFrames.load()
+              << ", late frames " << playback.lateFrames.load()
+              << ", realigns " << playback.realigns.load()
+              << ", clock steps " << playback.clockSteps.load()
               << "\n";
 
 }
@@ -104,7 +124,7 @@ void printReceiveStats(const ReceiveStats& stats, const PlaybackStats& playback)
     // Also true on the first call. miniaudio does not promise a fixed callback
     // size, and the filter assumes one, so it starts over when the size changes.
     if (frameCount != s.timeFilter.framesPerPeriod()) {
-        s.timeFilter.configure(kBandwidth, frameCount, s.deviceRate);
+        s.timeFilter.configure(kBandwidth, frameCount, s.deviceRate, kStartBandwidth, kStartSeconds);
         s.timeFilter.reset(t);
         s.loop.setFramesPerCallback(frameCount);
     } else {
@@ -114,26 +134,39 @@ void printReceiveStats(const ReceiveStats& stats, const PlaybackStats& playback)
     return s.timeFilter.time();
 }
 
-// The ring ran dry: start over. The loop waits until the ring holds its
-// target again, which also covers a sender that stopped.
+// The ring ran dry: start over. The loop waits until the due frame is in the
+// ring again, which also covers a sender that stopped.
 static void onUnderrun(PlaybackState& s, ma_uint32 frameCount) {
     s.loop.restart();
     s.resampler.reset();
     s.stats->underrunFrames.fetch_add(frameCount, std::memory_order_relaxed);
 }
 
-// How much of the margin the jitter used at most, while running: what the
-// margin needs to be, measured rather than guessed. Beyond the margin when
-// the ring ran dry.
-static void trackMarginUsed(PlaybackState& s, std::int64_t headroom) {
-    if (s.loop.phase() != RateLoop::Phase::Running) {
-        return;     // the start is the loop's transient, not jitter
+// The rate loop's error (see rate_loop.h): how far the frame due at the
+// speaker when this callback is heard lies ahead of the next frame played,
+// in sender frames. Nothing until there is a clock mapping and a timeline.
+[[nodiscard]] static std::optional<double> timingError(PlaybackState& s, double tD) {
+    // The seqlock read can fail while the clock-sync thread writes; the last
+    // mapping is then a fraction of a second old, which is fine.
+    if (const auto mapping = s.clock->mapping()) {
+        if (s.mapping && mapping->generation != s.mapping->generation) {
+            // A fresh estimate may have jumped: re-align to it.
+            s.loop.restart();
+            s.resampler.reset();
+            s.stats->clockSteps.fetch_add(1, std::memory_order_relaxed);
+        }
+        s.mapping = mapping;
     }
-    const std::int64_t used = static_cast<std::int64_t>(s.margin) - headroom;
-    if (used > s.maxMarginUsed) {
-        s.maxMarginUsed = used;
-        s.stats->maxMarginUsed.store(used, std::memory_order_relaxed);
+    if (!s.mapping) {
+        return std::nullopt;
     }
+
+    const double heard = localToMaster(s.originSeconds + tD + s.outputLatency, *s.mapping);
+    const auto ahead = s.timeline.framesAhead(heard, s.ring->readPosition());
+    if (!ahead) {
+        return std::nullopt;
+    }
+    return *ahead + s.resampler.inputDistance();
 }
 
 // Lowest headroom (ring fill beyond what a read takes) over a window, for the status line.
@@ -151,25 +184,37 @@ static void publishLoop(const PlaybackState& s) {
     s.stats->loopPhase.store(static_cast<int>(s.loop.phase()), std::memory_order_relaxed);
     s.stats->correction.store(s.loop.correction(), std::memory_order_relaxed);
     s.stats->delayError.store(s.loop.error(), std::memory_order_relaxed);
+    s.stats->realigns.store(s.loop.realigns(), std::memory_order_relaxed);
 }
 
 static void playSilence(const PlaybackState& s, void* output, ma_uint32 frameCount) {
     std::memset(output, 0, frameCount * s.bytesPerFrame);
 }
 
-// The rate loop's D side (see rate_loop.h): every callback measures the delay
-// error at its smoothed start time, steers the resampling ratio from it, and
-// then reads exactly what the resampler needs for this callback.
+// Every callback measures how far off its sound will be heard, steers the
+// resampling ratio from that (see rate_loop.h), and then reads exactly what
+// the resampler needs for this callback.
 static void onPlayback(void* user, void* output, ma_uint32 frameCount) {
     auto& s = *static_cast<PlaybackState*>(user);
     const double t = trackDeviceClock(s, frameCount);
 
     for (NetReport report; s.reports->pop(report); ) {
-        s.loop.addReport(report);
+        if (report.restart) {
+            s.loop.restart();       // a new stream, a new timeline: re-align
+        }
+        s.timeline.add(report);
     }
 
-    const auto step = s.loop.update(t, s.ring->readPosition(), s.resampler.inputDistance(), s.ring->availableRead());
+    const auto error = timingError(s, t);
+    const auto step = s.loop.update(t, error, s.ring->availableRead(), s.resampler.inputFor(frameCount));
     publishLoop(s);
+
+    if (step.trim > 0) {
+        // Only this thread reads, so the fill can only have grown since.
+        (void)s.ring->discard(step.trim);
+        (step.late ? s.stats->lateFrames : s.stats->trimmedFrames).fetch_add(step.trim, std::memory_order_relaxed);
+    }
+
     if (!step.play) {
         s.resampler.reset();
         s.stats->headroom.store(PlaybackStats::kHeadroomUnknown, std::memory_order_relaxed);
@@ -177,18 +222,11 @@ static void onPlayback(void* user, void* output, ma_uint32 frameCount) {
         return;
     }
 
-    if (step.trim > 0) {
-        // Only this thread reads, so the fill can only have grown since.
-        (void)s.ring->discard(step.trim);
-        s.stats->trimmedFrames.fetch_add(step.trim, std::memory_order_relaxed);
-    }
-
     s.resampler.setRatio(step.ratio);
     const std::size_t need = s.resampler.inputFor(frameCount);
     const std::size_t fill = s.ring->availableRead();
     const std::int64_t headroom = static_cast<std::int64_t>(fill) - static_cast<std::int64_t>(need);
     trackHeadroom(s, headroom, frameCount);
-    trackMarginUsed(s, headroom);
     if (need > fill) {
         onUnderrun(s, frameCount);
         playSilence(s, output, frameCount);
@@ -206,11 +244,13 @@ static void onPlayback(void* user, void* output, ma_uint32 frameCount) {
 class PacketReceiver {
 public:
     PacketReceiver(udp::socket& rx, Ring& ring, ReportQueue& reports, ReceiveStats& stats,
+                   const clocksync::ClockSync& clock,
                    std::size_t bytesPerFrame, unsigned int sampleRate, Clock::time_point origin)
     : rx_{rx}
     , ring_{ring}
     , reports_{reports}
     , stats_{stats}
+    , clock_{clock}
     , bytesPerFrame_{bytesPerFrame}
     , sampleRate_{sampleRate}
     , origin_{origin} {
@@ -293,27 +333,47 @@ private:
         }
         expectedSeq_ = header.seq + 1;
 
-        storePayload(header.frames, n - kAudioPacketHeaderBytes);
+        // Where the packet's first frame lands, past any concealed gap.
+        const std::uint64_t first = ring_.writePosition();
+        const bool stored = storePayload(header.frames, n - kAudioPacketHeaderBytes);
 
         arm();
 
         window_.addFill(ring_.availableRead());
         trackTiming(arrival, header.frames);
-        report();
+        trackLead(arrival, header.t);
+        if (stored) {
+            report(header.t, first);
+        } else {
+            // The positions after a missing packet no longer match the
+            // stamps: the timeline has to start over.
+            restartPending_ = true;
+        }
     }
 
-    // The timing starts over, and with it the rate loop, which is fed from it.
+    // The timing starts over, and with it the presentation timeline.
     void lostTrack() {
         filter_.invalidate();
         restartPending_ = true;
     }
 
-    // The rate loop's N side (see rate_loop.h): when the next packet is due,
-    // and where the ring's write position will be once it is in.
-    void report() {
-        if (reports_.push({filter_.nextTime(), ring_.writePosition() + filter_.framesPerPeriod(), restartPending_})) {
+    // A point on the presentation timeline (see presentation_timeline.h): the
+    // frame at ring position `first` is to be heard at master time `stamp`.
+    void report(std::uint64_t stamp, std::uint64_t first) {
+        if (reports_.push({static_cast<double>(stamp) * 1e-9, first, restartPending_})) {
             restartPending_ = false;
         }
+    }
+
+    // How long before its presentation time the packet arrived, in master
+    // time: the safety margin L leaves this receiver.
+    void trackLead(Clock::time_point arrival, std::uint64_t stamp) {
+        const auto mapping = clock_.mapping();
+        if (!mapping) {
+            return;
+        }
+        const double arrived = localToMaster(toSeconds(sinceEpoch(arrival)), *mapping);
+        window_.addLead(static_cast<double>(stamp) * 1e-9 - arrived);
     }
 
     void concealGap(std::uint32_t gap, std::uint32_t frames) {
@@ -333,14 +393,18 @@ private:
         }
     }
 
-    void storePayload(std::uint32_t frames, std::size_t payloadBytes) {
+    [[nodiscard]] bool storePayload(std::uint32_t frames, std::size_t payloadBytes) {
         if (payloadBytes != frames * bytesPerFrame_) {
             ++stats_.sizeMismatches;
             stats_.lastMismatchBytes = payloadBytes;
             stats_.lastMismatchFrames = frames;
-        } else if (!ring_.write(buf_.data() + kAudioPacketHeaderBytes, frames)) {
-            ++stats_.ringDrops;                // whole packet or nothing
+            return false;
         }
+        if (!ring_.write(buf_.data() + kAudioPacketHeaderBytes, frames)) {
+            ++stats_.ringDrops;                // whole packet or nothing
+            return false;
+        }
+        return true;
     }
 
     void trackTiming(Clock::time_point arrival, std::uint32_t frames) {
@@ -351,7 +415,7 @@ private:
             if (filter_.framesPerPeriod() != 0) {
                 ++stats_.frameCountChanges;
             }
-            filter_.configure(kBandwidth, frames, sampleRate_);
+            filter_.configure(kBandwidth, frames, sampleRate_, kStartBandwidth, kStartSeconds);
             lostTrack();
         }
 
@@ -368,6 +432,7 @@ private:
     Ring& ring_;
     ReportQueue& reports_;
     ReceiveStats& stats_;
+    const clocksync::ClockSync& clock_;
     const std::size_t bytesPerFrame_;
     const unsigned int sampleRate_;
     const Clock::time_point origin_;
@@ -387,7 +452,7 @@ struct Options {
     unsigned int outputDeviceIndex = 0;
     unsigned int senderSampleRate = kDefaultSampleRate;
     unsigned int periodSizeInFrames = kPeriodSizeInFrames;
-    double bufferMarginMs = kDefaultBufferMarginMs;
+    double outputLatencyMs = kDefaultOutputLatencyMs;
     std::string networkInterface;
     std::string multicastGroup{kDefaultMulticastGroup};
     unsigned short multicastPort = kDefaultMulticastPort;
@@ -438,8 +503,8 @@ std::optional<int> parseOptions(int argc, char** argv, const AudioContext& audio
         ->check(CLI::PositiveNumber);
     app.add_option("-f,--periodSizeInFrames", opts.periodSizeInFrames, "Period size in frames")
         ->check(CLI::PositiveNumber);
-    app.add_option("-b,--bufferMargin", opts.bufferMarginMs,
-                   "Receive buffer kept in reserve against network jitter, in milliseconds; fixed for the run")
+    app.add_option("--outputLatency", opts.outputLatencyMs,
+                   "Milliseconds from the audio callback to the sound leaving the speaker; measure it per receiver")
         ->check(CLI::NonNegativeNumber);
     app.add_option("-n,--networkInterface", opts.networkInterface, "Network interface");
     app.add_option("-m,--multicastGroup", opts.multicastGroup, "Multicast group address")
@@ -455,18 +520,19 @@ std::optional<int> parseOptions(int argc, char** argv, const AudioContext& audio
     return std::nullopt;
 }
 
-bool openSocket(udp::socket& rx, const Options& opts) {
+// Returns the interface it chose, for the clock sync to use too.
+std::optional<net::Interface> openSocket(udp::socket& rx, const Options& opts) {
     const auto chosen = !opts.networkInterface.empty() ? net::find(opts.networkInterface) : net::selectDefault();
     if (!chosen) {
         std::cerr << (!opts.networkInterface.empty() ? "No such interface\n" : "Ambiguous or none; name one explicitly\n");
-        return false;
+        return std::nullopt;
     }
     std::cout << "Using network interface " << chosen->name << " " << chosen->address.to_string() << "\n";
 
     const udp::endpoint group(asio::ip::make_address(opts.multicastGroup), opts.multicastPort);
     net::configureReceiver(rx, group, *chosen);
     std::cout << "Receiver configured\n";
-    return true;
+    return chosen;
 }
 
 // Runs `control` on the calling thread until SIGINT or SIGTERM.
@@ -501,7 +567,23 @@ int main(int argc, char** argv) {
 
     asio::io_context io;
     udp::socket rx(io);
-    if (!openSocket(rx, opts)) {
+    const auto iface = openSocket(rx, opts);
+    if (!iface) {
+        return 1;
+    }
+
+    // A clock-sync slave of the sender: master time is the sender's clock.
+    // Binding the socket and joining the group throw on failure.
+    std::optional<clocksync::ClockSync> clock;
+    try {
+        std::random_device rd;
+        clock.emplace(clocksync::Config{
+            .group = udp::endpoint(asio::ip::make_address(kClockGroup), kClockPort),
+            .iface = *iface,
+            .nodeId = (static_cast<std::uint64_t>(rd()) << 32) | rd(),
+        }, clocksync::Role::Slave);
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to set up the clock-sync slave: " << e.what() << "\n";
         return 1;
     }
 
@@ -520,21 +602,14 @@ int main(int argc, char** argv) {
 
     const auto origin  = Clock::now();
 
-    // In sender frames: it is kept in the ring, ahead of the resampler.
-    const auto margin = static_cast<std::size_t>(
-        std::lround(opts.bufferMarginMs * opts.senderSampleRate / 1000.0));
-    if (margin > kMaxMargin) {
-        std::cerr << "Buffer margin of " << opts.bufferMarginMs << " ms does not fit the "
-                  << kMaxMargin << " frame limit\n";
-        return 2;
-    }
-
     PlaybackState state{
-        .margin = margin,
+        .outputLatency = opts.outputLatencyMs / 1000.0,
         .ring = &frameRing,
         .reports = &reports,
         .stats = &playbackStats,
+        .clock = &*clock,
         .origin = origin,
+        .originSeconds = toSeconds(sinceEpoch(origin)),
     };
 
     AudioPlayer player;
@@ -546,7 +621,7 @@ int main(int argc, char** argv) {
     const double nominalRatio = static_cast<double>(opts.senderSampleRate) / deviceRate;
     std::cout << "playback: " << player.channels() << " ch s16 @ " << deviceRate << " Hz, "
               << "sender @ " << opts.senderSampleRate << " Hz, "
-              << "buffer margin " << margin << " frames (" << opts.bufferMarginMs << " ms)\n";
+              << "output latency " << opts.outputLatencyMs << " ms\n";
 
     // Everything the audio callback touches has to be in place before start().
     const std::size_t bytesPerFrame = player.bytesPerFrame();
@@ -562,17 +637,18 @@ int main(int argc, char** argv) {
         .nominalRatio = nominalRatio,
         .deviceRate = static_cast<double>(deviceRate),
         .framesPerCallback = opts.periodSizeInFrames,
-        .resamplerDelay = static_cast<double>(state.resampler.halfLength()),
-        .margin = static_cast<double>(margin),
+        .realignFrames = kRealignMs / 1000.0 * opts.senderSampleRate,
     });
-    playbackStats.margin.store(margin, std::memory_order_relaxed);
 
-    PacketReceiver receiver(rx, frameRing, reports, stats, bytesPerFrame, opts.senderSampleRate, origin);
+    PacketReceiver receiver(rx, frameRing, reports, stats, *clock, bytesPerFrame, opts.senderSampleRate, origin);
 
     // The main thread only reports and waits for signals; packets never wait for it.
     asio::io_context control;
-    StatusReporter reporter(control, io, [&receiver]{ return receiver.takeSnapshot(); }, playbackStats,
+    StatusReporter reporter(control, io, [&receiver]{ return receiver.takeSnapshot(); }, playbackStats, *clock,
                             opts.senderSampleRate, deviceRate, bytesPerFrame, origin);
+
+    // Before playback, so the mapping can settle while the receiver is silent.
+    clock->start();
 
     if (!player.start()) {
         std::cerr << "Failed to start the playback device\n";
@@ -602,6 +678,7 @@ int main(int argc, char** argv) {
     // From inside the io thread, which owns the receiver.
     asio::post(io, [&receiver]{ receiver.stop(); });
     worker.join();
+    clock->stop();      // after both of its readers
 
     printReceiveStats(stats, playbackStats);
 

@@ -1,22 +1,30 @@
 #ifndef TIME_FILTER_H
 #define TIME_FILTER_H
 
+#include <cstdint>
 #include <numbers>
 
 #include <miniaudio.h>
 
 class TimeFilter {
 public:
-    void configure(double bandwidth, ma_uint32 framesPerPeriod, double nominalRate) {
+    // For the first `startSeconds` after a reset the filter runs at
+    // `startBandwidth`, so a start-up disturbance (a burst of callbacks as a
+    // device starts) settles in about a second rather than half a minute at
+    // `bandwidth`. A changed bandwidth keeps the filter's state.
+    void configure(double bandwidth, ma_uint32 framesPerPeriod, double nominalRate,
+                   double startBandwidth = 0.0, double startSeconds = 0.0) {
         framesPerPeriod_ = framesPerPeriod;
         nominalPeriod_ = static_cast<double>(framesPerPeriod) / nominalRate;
-
-        const double w = 2.0 * std::numbers::pi * bandwidth * nominalPeriod_;
-        b_ = std::numbers::sqrt2 * w;
-        c_ = w * w;
+        bandwidth_ = bandwidth;
+        startBandwidth_ = startBandwidth > 0.0 ? startBandwidth : bandwidth;
+        startFrames_ = static_cast<std::uint64_t>(startSeconds * nominalRate);
+        setGains(starting_ ? startBandwidth_ : bandwidth_);
     }
 
     void reset(double t) noexcept {
+        starting_ = startFrames_ > 0;
+        setGains(starting_ ? startBandwidth_ : bandwidth_);
         t0_ = t;
         e2_ = nominalPeriod_;
         t1_ = t + e2_;
@@ -34,6 +42,11 @@ public:
 
         n0_ = n1_;
         n1_ += framesPerPeriod_;
+
+        if (starting_ && n0_ >= startFrames_) {
+            starting_ = false;
+            setGains(bandwidth_);
+        }
     }
 
     void skip(std::uint32_t missing) noexcept {
@@ -53,7 +66,16 @@ public:
     void invalidate() { ready_ = false; }
 
 private:
+    void setGains(double bandwidth) noexcept {
+        const double w = 2.0 * std::numbers::pi * bandwidth * nominalPeriod_;
+        b_ = std::numbers::sqrt2 * w;
+        c_ = w * w;
+    }
+
     double b_ = 0.0, c_ = 0.0;
+    double bandwidth_ = 0.0, startBandwidth_ = 0.0;
+    std::uint64_t startFrames_ = 0;
+    bool starting_ = false;
     double nominalPeriod_ = 0.0;
     ma_uint32 framesPerPeriod_ = 0;
 

@@ -106,7 +106,8 @@ void ClockSync::stop() {
         ClockMapping m {
             .localRef = localRef_.load(std::memory_order_relaxed),
             .masterRef = masterRef_.load(std::memory_order_relaxed),
-            .skew = skew_.load(std::memory_order_relaxed)
+            .skew = skew_.load(std::memory_order_relaxed),
+            .generation = generation_.load(std::memory_order_relaxed),
         };
         std::atomic_thread_fence(std::memory_order_acquire);
         if (seq_.load(std::memory_order_relaxed) == s0) {
@@ -116,13 +117,14 @@ void ClockSync::stop() {
     return std::nullopt;
 }
 
-void ClockSync::updateMapping(double localRef, double masterRef, double skew) {
+void ClockSync::updateMapping(const ClockMapping& mapping) {
     const std::size_t s0 = seq_.load(std::memory_order_relaxed);
     seq_.store(s0 + 1, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_release);
-    localRef_.store(localRef, std::memory_order_relaxed);
-    masterRef_.store(masterRef, std::memory_order_relaxed);
-    skew_.store(skew, std::memory_order_relaxed);
+    localRef_.store(mapping.localRef, std::memory_order_relaxed);
+    masterRef_.store(mapping.masterRef, std::memory_order_relaxed);
+    skew_.store(mapping.skew, std::memory_order_relaxed);
+    generation_.store(mapping.generation, std::memory_order_relaxed);
     seq_.store(s0 + 2, std::memory_order_release);
 }
 
@@ -269,7 +271,7 @@ void ClockSync::handleReceive(std::size_t n, Clock::time_point t) {
             const auto mapping = servo_.mapping();
 
             if (mapping) {
-                updateMapping(mapping->localRef, mapping->masterRef, mapping->skew);
+                updateMapping(*mapping);
                 if (onSample_) {
                     onSample_(Sample{
                         .offset       = toSeconds(offset),

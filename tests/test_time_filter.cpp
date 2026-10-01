@@ -116,3 +116,30 @@ TEST_CASE("the filter converges on a clock running off nominal", "[time_filter]"
     REQUIRE(std::abs(filter.error()) < firstError);
     REQUIRE(std::abs(filter.error()) < 1e-6);
 }
+
+TEST_CASE("a fast start settles sooner, then runs at the bandwidth", "[time_filter]") {
+    // The true period is 0.1% longer than nominal.
+    const double truePeriod = kNominalPeriod * 1.001;
+
+    TimeFilter fast, plain;
+    fast.configure(kBandwidth, kFramesPerPeriod, kNominalRate, 5.0, 1.0);
+    plain.configure(kBandwidth, kFramesPerPeriod, kNominalRate);
+    fast.reset(0.0);
+    plain.reset(0.0);
+    for (int i = 1; i <= 100; ++i) {        // one second
+        fast.update(i * truePeriod);
+        plain.update(i * truePeriod);
+    }
+    REQUIRE(std::abs(fast.period() - truePeriod) < 0.1 * std::abs(plain.period() - truePeriod));
+
+    // Past the start, the same disturbance moves both by the same amount.
+    for (int i = 101; i <= 2000; ++i) {
+        fast.update(i * truePeriod);
+        plain.update(i * truePeriod);
+    }
+    const double fastBefore = fast.period();
+    const double plainBefore = plain.period();
+    fast.update(2001 * truePeriod + 1e-3);
+    plain.update(2001 * truePeriod + 1e-3);
+    REQUIRE(fast.period() - fastBefore == Approx(plain.period() - plainBefore).epsilon(1e-6));
+}

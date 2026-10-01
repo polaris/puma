@@ -10,6 +10,7 @@ add_executable(puma_tests
     test_audio_packet.cpp
     test_resampler.cpp
     test_rate_loop.cpp
+    test_presentation_timeline.cpp
 )
 
 target_compile_features(puma_tests PRIVATE cxx_std_20)

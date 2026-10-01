@@ -13,6 +13,8 @@
 
 #include "receive_stats.h"
 
+namespace clocksync { class ClockSync; }
+
 // Keeps a status line up to date on stderr, and prints what the receiver only
 // counts as lines of their own above it.
 //
@@ -30,7 +32,8 @@ public:
     // `takeSnapshot` is called on the thread running `receiveIo`, and is
     // expected to start a new ReceiveWindow each time.
     StatusReporter(asio::io_context& control, asio::io_context& receiveIo, SnapshotSource takeSnapshot,
-                   const PlaybackStats& playback, unsigned int nominalRate, unsigned int deviceNominalRate,
+                   const PlaybackStats& playback, const clocksync::ClockSync& clock,
+                   unsigned int nominalRate, unsigned int deviceNominalRate,
                    std::size_t bytesPerFrame, Clock::time_point origin);
 
     StatusReporter(const StatusReporter&) = delete;
@@ -50,6 +53,7 @@ private:
     [[nodiscard]] std::string statusLine(const ReceiverSnapshot& snapshot) const;
 
     void appendLoop(std::ostringstream& line) const;
+    void appendClock(std::ostringstream& line) const;
     static void appendRate(std::ostringstream& line, double rate, unsigned int nominal);
     static void appendPpm(std::ostringstream& line, double ratio);
     static void appendIfAny(std::ostringstream& line, const char* label, std::uint64_t count);
@@ -63,6 +67,7 @@ private:
     Clock::time_point next_;
     const SnapshotSource takeSnapshot_;
     const PlaybackStats& playback_;
+    const clocksync::ClockSync& clock_;
     const unsigned int nominalRate_;        // the sender's
     const unsigned int deviceNominalRate_;
     const std::size_t bytesPerFrame_;

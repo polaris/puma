@@ -76,7 +76,6 @@ struct SenderContext {
     // Audio thread only.
     std::uint32_t sequence = 0;
     TimeFilter filter{};
-    bool settled = false;            // filter down from kStartBandwidth to kBandwidth
 };
 
 // Smoothed start time of this callback, in seconds since origin. The raw
@@ -92,17 +91,12 @@ struct SenderContext {
         if (ctx.filter.framesPerPeriod() != 0) {
             ++ctx.session;
         }
-        ctx.filter.configure(kStartBandwidth, frameCount, ctx.sampleRate);
+        ctx.filter.configure(kBandwidth, frameCount, ctx.sampleRate, kStartBandwidth, kStartSeconds);
         ctx.filter.reset(t);
-        ctx.settled = false;
         return ctx.filter.time();
     }
 
     ctx.filter.update(t);
-    if (!ctx.settled && static_cast<double>(ctx.filter.frame()) >= kStartSeconds * ctx.sampleRate) {
-        ctx.filter.configure(kBandwidth, frameCount, ctx.sampleRate);    // keeps the filter's state
-        ctx.settled = true;
-    }
     return ctx.filter.time();
 }
 

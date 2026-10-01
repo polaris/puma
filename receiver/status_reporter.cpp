@@ -8,17 +8,20 @@
 
 #include <asio/post.hpp>
 
+#include "clock_sync.h"
 #include "rate_loop.h"
 #include "terminal.h"
 
 StatusReporter::StatusReporter(asio::io_context& control, asio::io_context& receiveIo, SnapshotSource takeSnapshot,
-                               const PlaybackStats& playback, unsigned int nominalRate, unsigned int deviceNominalRate,
+                               const PlaybackStats& playback, const clocksync::ClockSync& clock,
+                               unsigned int nominalRate, unsigned int deviceNominalRate,
                                std::size_t bytesPerFrame, Clock::time_point origin)
 : control_{control}
 , receiveIo_{receiveIo}
 , timer_{control}
 , takeSnapshot_{std::move(takeSnapshot)}
 , playback_{playback}
+, clock_{clock}
 , nominalRate_{nominalRate}
 , deviceNominalRate_{deviceNominalRate}
 , bytesPerFrame_{bytesPerFrame}
@@ -130,16 +133,24 @@ std::string StatusReporter::statusLine(const ReceiverSnapshot& snapshot) const {
         line << "--";
     }
 
-    line << "  headroom ";
-    if (const std::int64_t headroom = playback_.headroom.load(std::memory_order_relaxed);
-        headroom != PlaybackStats::kHeadroomUnknown) {
-        line << headroom << '/' << playback_.margin.load(std::memory_order_relaxed)
-             << " (max used " << playback_.maxMarginUsed.load(std::memory_order_relaxed) << ')';
+    appendClock(line);
+    appendLoop(line);
+
+    // The margin L leaves: how early packets arrive, at the least.
+    line << "  lead ";
+    if (window.leads > 0) {
+        line << std::setprecision(1) << window.minLead * 1e3 << '-' << window.maxLead * 1e3 << " ms";
     } else {
         line << "--";
     }
 
-    appendLoop(line);
+    line << "  headroom ";
+    if (const std::int64_t headroom = playback_.headroom.load(std::memory_order_relaxed);
+        headroom != PlaybackStats::kHeadroomUnknown) {
+        line << headroom;
+    } else {
+        line << "--";
+    }
 
     line << "  ring ";
     if (window.packets > 0) {
@@ -152,6 +163,9 @@ std::string StatusReporter::statusLine(const ReceiverSnapshot& snapshot) const {
          << "  drops " << stats.ringDrops
          << "  underruns " << playback_.underrunFrames.load(std::memory_order_relaxed)
          << "  trimmed " << playback_.trimmedFrames.load(std::memory_order_relaxed);
+    appendIfAny(line, "late", playback_.lateFrames.load(std::memory_order_relaxed));
+    appendIfAny(line, "realigns", playback_.realigns.load(std::memory_order_relaxed));
+    appendIfAny(line, "clock-steps", playback_.clockSteps.load(std::memory_order_relaxed));
 
     // Rare trouble, shown once it has happened.
     appendIfAny(line, "conceal-fail", stats.concealFailures);
@@ -171,8 +185,18 @@ std::string StatusReporter::statusLine(const ReceiverSnapshot& snapshot) const {
     return line.str();
 }
 
-// The rate loop's correction should settle on the drift; its error, in
-// frames, near zero.
+// This receiver's view of master time: the estimated offset from it.
+void StatusReporter::appendClock(std::ostringstream& line) const {
+    line << "  clock ";
+    if (!clock_.mapping()) {
+        line << "--";
+        return;
+    }
+    line << std::showpos << std::setprecision(1) << clock_.stats().offset * 1e6 << std::noshowpos << " us";
+}
+
+// The rate loop's correction should settle on the drift; its error, how far
+// off this receiver plays by its own clock, near zero.
 void StatusReporter::appendLoop(std::ostringstream& line) const {
     line << "  loop ";
     const auto phase = static_cast<RateLoop::Phase>(playback_.loopPhase.load(std::memory_order_relaxed));
@@ -182,7 +206,7 @@ void StatusReporter::appendLoop(std::ostringstream& line) const {
     }
     appendPpm(line, 1.0 + playback_.correction.load(std::memory_order_relaxed));
     line << " err " << std::showpos << std::setprecision(1)
-         << playback_.delayError.load(std::memory_order_relaxed) << std::noshowpos;
+         << playback_.delayError.load(std::memory_order_relaxed) / nominalRate_ * 1e6 << std::noshowpos << " us";
     if (phase == RateLoop::Phase::Settling) {
         line << " settling";
     }

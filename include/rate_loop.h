@@ -6,30 +6,22 @@
 #include <cstddef>
 #include <cstdint>
 #include <numbers>
+#include <optional>
 
-// One per packet, from the network thread to the audio thread: a point on the
-// network side's frame count line. By time `t`, `k` frames will have been
-// written to the ring.
-struct NetReport {
-    double t = 0.0;             // predicted arrival of the next packet (TimeFilter::nextTime())
-    std::uint64_t k = 0;        // ring write position once that packet is in
-    bool restart = false;       // the network side lost track; earlier reports no longer apply
-};
-
-// Steers the resampling ratio so the delay from the network to the device
-// stays constant, after Adriaensen, "Controlling adaptive resampling". Runs
-// on the audio thread, once per callback; the network thread is the paper's
-// ALSA side (it only reports), the callback its Jack side.
+// Steers the resampling ratio so every frame leaves the speaker at its
+// presentation time, after Adriaensen, "Controlling adaptive resampling".
+// Runs on the audio thread, once per callback.
 //
-//   N side: network thread, reports (t_N, k_N) points, k_N = ring write position
-//   D side: audio callback, t_D from its TimeFilter, k_D = ring read position
+// The error, in input frames, is how far the frame due at the speaker lies
+// ahead of the frame about to be played:
 //
-// Delay error, the paper's eq. (1) and (2):
+//   m = localToMaster(t_D + output latency)     when this callback is heard
+//   E = [k*(m) - k_D] + d_res                    k*(m) from the PresentationTimeline
 //
-//   d_N = (k_N1 - k_N0) * (t_D - t_N0) / (t_N1 - t_N0)
-//   E   = [k_N0 - k_D] + d_N + d_res - target
+// E > 0 means late: read faster, the ratio goes up. E < 0 means early.
 //
-// E > 0 means more is buffered than wanted: read faster, the ratio goes up.
+// The loop only steers. Where the error comes from is the caller's business,
+// so a target time and a target fill are the same loop.
 class RateLoop {
 public:
     enum class Phase { Waiting, Settling, Running };
@@ -38,18 +30,20 @@ public:
         double nominalRatio = 1.0;          // sender rate / device rate
         double deviceRate = 48000.0;
         std::size_t framesPerCallback = 0;
-        double resamplerDelay = 0.0;        // average d_res while running
-        double margin = 0.0;                // frames kept against network jitter
         double bandwidth = 0.05;            // Hz
         double startBandwidth = 0.5;        // Hz, for the first startSeconds after a start
         double startSeconds = 4.0;
         double maxCorrection = 0.005;       // relative, either way
+        // Past this, in frames, the loop starts over instead of steering: at
+        // maxCorrection, steering 5 ms away takes a second.
+        double realignFrames = 240.0;
     };
 
     // What the callback should do.
     struct Step {
-        bool play = false;                  // false: output silence and read nothing
-        std::uint64_t trim = 0;             // frames to discard from the ring before reading
+        bool play = false;                  // false: output silence and read nothing more
+        std::uint64_t trim = 0;             // frames to discard from the ring first, even when not playing
+        bool late = false;                  // the trim is frames that were due before they arrived
         double ratio = 1.0;                 // input frames per output frame
     };
 
@@ -60,11 +54,10 @@ public:
         restart();
     }
 
-    // Back to waiting for the delay to be reached. Keeps the learned clock
-    // difference, so a restart settles fast.
+    // Back to waiting for the due frame. Keeps the learned clock difference,
+    // so a restart settles fast.
     void restart() noexcept {
         phase_ = Phase::Waiting;
-        reports_ = 0;
         lowpass1_ = lowpass2_ = 0.0;
     }
 
@@ -74,41 +67,47 @@ public:
         setBandwidth(phase_ == Phase::Running ? config_.bandwidth : config_.startBandwidth);
     }
 
-    void addReport(const NetReport& report) noexcept {
-        if (report.restart) {
-            restart();
-        }
-        tN0_ = tN1_;
-        kN0_ = kN1_;
-        tN1_ = report.t;
-        kN1_ = report.k;
-        ++reports_;
-    }
-
     // Once per callback, before reading. `tD` is the smoothed start time of
-    // this callback, `kD` the ring read position, `dRes` the resampler's
-    // inputDistance(), `available` what the ring holds now.
-    [[nodiscard]] Step update(double tD, std::uint64_t kD, double dRes, std::uint64_t available) noexcept {
-        if (reports_ < 2 || !(tN1_ > tN0_)) {
+    // this callback, `error` the error above (nothing while it cannot be
+    // known: no clock mapping, too few reports), `available` what the ring
+    // holds and `need` what the next read takes at about the current ratio.
+    [[nodiscard]] Step update(double tD, std::optional<double> error, std::uint64_t available,
+                              std::size_t need) noexcept {
+        if (!error) {
+            restart();
             return {};
         }
+        error_ = *error;
 
-        // Integer subtraction first: the counters are too large for a double.
-        const double dN = static_cast<double>(kN1_ - kN0_) * (tD - tN0_) / (tN1_ - tN0_);
-        error_ = static_cast<double>(static_cast<std::int64_t>(kN0_ - kD)) + dN + dRes - target();
+        if (phase_ != Phase::Waiting && std::abs(error_) > config_.realignFrames) {
+            restart();
+            ++realigns_;
+        }
 
         Step step;
         if (phase_ == Phase::Waiting) {
-            // Too little buffered: let the ring fill. The ring has to really
-            // hold the target too, bar the packet the smooth line runs ahead
-            // by: once the stream stops, the line extrapolates on while the
-            // ring stays empty.
-            if (error_ < 0.0 || static_cast<double>(available) + packetFrames() < target()) {
+            // Not due yet: silence until it is.
+            if (error_ < 0.0) {
                 return {};
             }
-            // Too much: trim the excess at once (section 3.4), the loop removes the rest.
-            step.trim = std::min(static_cast<std::uint64_t>(std::llround(error_)), available);
-            error_ -= static_cast<double>(step.trim);
+            // Due, or past due: the frames before the due one are too late
+            // to play (section 3.4: trim at once, the loop removes the rest).
+            const auto due = static_cast<std::uint64_t>(std::llround(error_));
+            if (due > available) {
+                // Not even the due frame is in: all of it is late.
+                step.trim = available;
+                step.late = true;
+                error_ -= static_cast<double>(available);
+                return step;
+            }
+            // The read after the trim must not run dry; the ratio may still
+            // move the need by up to maxCorrection.
+            const auto slack = static_cast<std::uint64_t>(std::ceil(static_cast<double>(need) * config_.maxCorrection)) + 1;
+            if (available - due < need + slack) {
+                return {};
+            }
+            step.trim = due;
+            error_ -= static_cast<double>(due);
             phase_ = Phase::Settling;
             settleUntil_ = tD + config_.startSeconds;
             setBandwidth(config_.startBandwidth);
@@ -128,23 +127,12 @@ public:
         return step;
     }
 
-    // The delay to keep, in input frames: what one callback reads, the step
-    // by which the ring fills (a packet; the N line is smooth), what sits in
-    // the resampler, and the margin against jitter.
-    [[nodiscard]] double target() const noexcept {
-        return config_.nominalRatio * static_cast<double>(config_.framesPerCallback)
-             + packetFrames() + config_.resamplerDelay + config_.margin;
-    }
-
     [[nodiscard]] Phase phase() const noexcept { return phase_; }
     [[nodiscard]] double error() const noexcept { return error_; }            // frames, last update
     [[nodiscard]] double correction() const noexcept { return correction_; }  // relative to nominal
+    [[nodiscard]] std::uint64_t realigns() const noexcept { return realigns_; }
 
 private:
-    [[nodiscard]] double packetFrames() const noexcept {
-        return reports_ >= 2 ? static_cast<double>(kN1_ - kN0_) : 0.0;
-    }
-
     // Critically damped: both poles at 1 - w, w the loop bandwidth in radians
     // per callback. The gains turn frames of error into a ratio, with one
     // callback reading nominalRatio * framesPerCallback input frames.
@@ -161,15 +149,12 @@ private:
     Phase phase_ = Phase::Waiting;
     double settleUntil_ = 0.0;
 
-    double tN0_ = 0.0, tN1_ = 0.0;
-    std::uint64_t kN0_ = 0, kN1_ = 0;
-    int reports_ = 0;
-
     double w0_ = 0.0, kp_ = 0.0, ki_ = 0.0;
     double lowpass1_ = 0.0, lowpass2_ = 0.0;
     double integral_ = 0.0;         // learns the clock difference
     double error_ = 0.0;
     double correction_ = 0.0;
+    std::uint64_t realigns_ = 0;
 };
 
 #endif  // RATE_LOOP_H
