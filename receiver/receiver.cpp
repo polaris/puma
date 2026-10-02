@@ -1,24 +1,23 @@
-
-#include <asio.hpp>
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <future>
 #include <iostream>
 #include <limits>
 #include <optional>
-#include <random>
 #include <string>
-#include <string_view>
 #include <thread>
 #include <utility>
+
+#include <asio.hpp>
 #include <CLI/CLI.hpp>
 
-// time_filter.h pulls in the miniaudio declarations; the implementation block
-// sits outside that header's include guard, so this has to be compiled here.
+// The audio headers below pull in the miniaudio declarations; the
+// implementation block sits outside miniaudio.h's include guard, so it has to
+// be compiled here, once.
 #define MA_IMPLEMENTATION
 #include <miniaudio.h>
 
@@ -26,6 +25,8 @@
 #include "audio_packet.h"
 #include "audio_player.h"
 #include "clock_sync.h"
+#include "exit_codes.h"
+#include "frame_ring.h"
 #include "netint.h"
 #include "presentation_timeline.h"
 #include "rate_loop.h"
@@ -37,7 +38,6 @@
 #include "stream_defaults.h"
 #include "thread_priority.h"
 #include "time_filter.h"
-#include "frame_ring.h"
 
 using asio::ip::udp;
 using Clock = std::chrono::steady_clock;
@@ -50,6 +50,8 @@ using streaming::kNumPeriods;
 using streaming::kPeriodSizeInFrames;
 using streaming::kStartBandwidth;
 using streaming::kStartSeconds;
+
+namespace {
 
 constexpr unsigned int kDefaultSampleRate = 48000;
 
@@ -83,7 +85,7 @@ struct PlaybackState {
     PlaybackStats* stats = nullptr;
     const clocksync::ClockSync* clock = nullptr;
 
-    std::chrono::steady_clock::time_point origin;
+    Clock::time_point origin;
     double originSeconds = 0.0;         // origin as clocksync's local time: seconds since the steady epoch
 
     // Audio thread only.
@@ -114,10 +116,9 @@ void printReceiveStats(const ReceiveStats& stats, const PlaybackStats& playback)
               << ", realigns " << playback.realigns.load()
               << ", clock steps " << playback.clockSteps.load()
               << "\n";
-
 }
 
-[[nodiscard]] static double trackDeviceClock(PlaybackState& s, ma_uint32 frameCount) {
+[[nodiscard]] double trackDeviceClock(PlaybackState& s, ma_uint32 frameCount) {
     const auto t = std::chrono::duration<double>(Clock::now() - s.origin).count();
     // Also true on the first call. miniaudio does not promise a fixed callback
     // size, and the filter assumes one, so it starts over when the size changes.
@@ -134,7 +135,7 @@ void printReceiveStats(const ReceiveStats& stats, const PlaybackStats& playback)
 
 // The ring ran dry: start over. The loop waits until the due frame is in the
 // ring again, which also covers a sender that stopped.
-static void onUnderrun(PlaybackState& s, ma_uint32 frameCount) {
+void onUnderrun(PlaybackState& s, ma_uint32 frameCount) {
     s.loop.restart();
     s.resampler.reset();
     s.stats->underrunFrames.fetch_add(frameCount, std::memory_order_relaxed);
@@ -143,7 +144,7 @@ static void onUnderrun(PlaybackState& s, ma_uint32 frameCount) {
 // The rate loop's error (see rate_loop.h): how far the frame due at the
 // speaker when this callback is heard lies ahead of the next frame played,
 // in sender frames. Nothing until there is a clock mapping and a timeline.
-[[nodiscard]] static std::optional<double> timingError(PlaybackState& s, double tD) {
+[[nodiscard]] std::optional<double> timingError(PlaybackState& s, double tD) {
     // The seqlock read can fail while the clock-sync thread writes; the last
     // mapping is then a fraction of a second old, which is fine.
     if (const auto mapping = s.clock->mapping()) {
@@ -168,7 +169,7 @@ static void onUnderrun(PlaybackState& s, ma_uint32 frameCount) {
 }
 
 // Lowest headroom (ring fill beyond what a read takes) over a window, for the status line.
-static void trackHeadroom(PlaybackState& s, std::int64_t headroom, ma_uint32 frameCount) {
+void trackHeadroom(PlaybackState& s, std::int64_t headroom, ma_uint32 frameCount) {
     s.windowMinHeadroom = std::min(s.windowMinHeadroom, headroom);
     s.windowFrames += frameCount;
     if (s.windowFrames >= s.headroomWindowFrames) {
@@ -178,21 +179,21 @@ static void trackHeadroom(PlaybackState& s, std::int64_t headroom, ma_uint32 fra
     }
 }
 
-static void publishLoop(const PlaybackState& s) {
+void publishLoop(const PlaybackState& s) {
     s.stats->loopPhase.store(static_cast<int>(s.loop.phase()), std::memory_order_relaxed);
     s.stats->correction.store(s.loop.correction(), std::memory_order_relaxed);
     s.stats->delayError.store(s.loop.error(), std::memory_order_relaxed);
     s.stats->realigns.store(s.loop.realigns(), std::memory_order_relaxed);
 }
 
-static void playSilence(const PlaybackState& s, void* output, ma_uint32 frameCount) {
+void playSilence(const PlaybackState& s, void* output, ma_uint32 frameCount) {
     std::memset(output, 0, frameCount * s.bytesPerFrame);
 }
 
 // Every callback measures how far off its sound will be heard, steers the
 // resampling ratio from that (see rate_loop.h), and then reads exactly what
 // the resampler needs for this callback.
-static void onPlayback(void* user, void* output, ma_uint32 frameCount) {
+void onPlayback(void* user, void* output, ma_uint32 frameCount) {
     auto& s = *static_cast<PlaybackState*>(user);
     const double t = trackDeviceClock(s, frameCount);
 
@@ -521,15 +522,17 @@ std::optional<net::Interface> openSocket(udp::socket& rx, const Options& opts) {
     return chosen;
 }
 
+}  // namespace
+
 int main(int argc, char** argv) {
     AudioContext audio;
     if (!audio.init()) {
         std::cerr << "Failed to initialise the audio context\n";
-        return 2;
+        return exit_code::kAudio;
     }
     if (audio.playbackCount() == 0) {
         std::cerr << "No audio playback devices available\n";
-        return 2;
+        return exit_code::kAudio;
     }
 
     Options opts;
@@ -539,14 +542,14 @@ int main(int argc, char** argv) {
 
     if (opts.outputDeviceIndex >= audio.playbackCount()) {
         std::cerr << "Output device with index " << opts.outputDeviceIndex << " not available\n";
-        return 2;
+        return exit_code::kAudio;
     }
 
     asio::io_context io;
     udp::socket rx(io);
     const auto iface = openSocket(rx, opts);
     if (!iface) {
-        return 1;
+        return exit_code::kNetwork;
     }
 
     // A clock-sync slave of the sender: master time is the sender's clock.
@@ -560,7 +563,7 @@ int main(int argc, char** argv) {
         }, clocksync::Role::Slave);
     } catch (const std::exception& e) {
         std::cerr << "Failed to set up the clock-sync slave: " << e.what() << "\n";
-        return 1;
+        return exit_code::kNetwork;
     }
 
     AudioPlayer::Config playerConfig {
@@ -576,7 +579,7 @@ int main(int argc, char** argv) {
     ReceiveStats stats;
     PlaybackStats playbackStats;
 
-    const auto origin  = Clock::now();
+    const auto origin = Clock::now();
 
     PlaybackState state{
         .outputLatency = opts.outputLatencyMs / 1000.0,
@@ -591,7 +594,7 @@ int main(int argc, char** argv) {
     AudioPlayer player;
     if (!player.open(audio, audio.playbackInfo(opts.outputDeviceIndex).id, playerConfig, onPlayback, &state)) {
         std::cerr << "Failed to open the selected output device\n";
-        return 2;
+        return exit_code::kAudio;
     }
     const unsigned int deviceRate = player.sampleRate();
     const double nominalRatio = static_cast<double>(opts.senderSampleRate) / deviceRate;
@@ -603,7 +606,7 @@ int main(int argc, char** argv) {
     const std::size_t bytesPerFrame = player.bytesPerFrame();
     if (!frameRing.init(bytesPerFrame)) {
         std::cerr << "Unsupported frame size: " << bytesPerFrame << " bytes\n";
-        return 2;
+        return exit_code::kAudio;
     }
     state.deviceRate = deviceRate;
     state.bytesPerFrame = bytesPerFrame;
@@ -628,7 +631,7 @@ int main(int argc, char** argv) {
 
     if (!player.start()) {
         std::cerr << "Failed to start the playback device\n";
-        return 2;
+        return exit_code::kAudio;
     }
 
     receiver.start();
