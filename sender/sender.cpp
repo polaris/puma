@@ -39,7 +39,6 @@ using streaming::kAudioPacketHeaderBytes;
 
 constexpr ma_uint32   kPeriodSizeInFrames = 240;
 constexpr ma_uint32   kNumPeriods = 3;
-constexpr ma_uint32   kCaptureDeviceIndex = 0;      // no option for this yet
 
 // CPU the send thread needs per packet, at most; for the real-time scheduler.
 constexpr auto kSendComputation = std::chrono::microseconds(500);
@@ -137,21 +136,58 @@ void data_callback(void* user, const void* input, ma_uint32 frameCount) {
 }
 
 struct Options {
+    unsigned int inputDeviceIndex = 0;
     std::string networkInterface;
     double latencyMs = kDefaultLatencyMs;
 };
 
-// Returns an exit code if the program should end here (--help, bad input),
-// nothing if it should go on.
-std::optional<int> parseOptions(int argc, char** argv, Options& opts) {
+void enumerateInputDevices(const AudioContext& audio) {
+    for (ma_uint32 deviceIndex = 0; deviceIndex < audio.captureCount(); deviceIndex += 1) {
+        const ma_device_info& info = audio.captureInfo(deviceIndex);
+        std::cout << deviceIndex << " - " << info.name
+                  << (info.isDefault ? " (default)" : "") << "\n";
+    }
+}
+
+void enumerateNetworkInterfaces() {
+    const auto all = net::enumerate();
+    std::cout << "interfaces:\n";
+    for (const auto& i : all) {
+        std::cout << "  " << i.name << "  " << i.address.to_string() << "  idx=" << i.index;
+        if (!i.description.empty()) {
+            std::cout << "  (" << i.description << ")";
+        }
+        std::cout << "\n";
+    }
+}
+
+// Returns an exit code if the program should end here (--help, enumeration,
+// bad input), nothing if it should go on.
+std::optional<int> parseOptions(int argc, char** argv, const AudioContext& audio, Options& opts) {
     CLI::App app{"Sender"};
     argv = app.ensure_utf8(argv);
 
+    app.add_flag("--enumInputDevices",
+        [&audio] (int64_t) {
+            enumerateInputDevices(audio);
+            throw CLI::Success();
+        }, "Enumerate audio input devices")
+        ->trigger_on_parse();
+    app.add_flag("--enumNetworkInterfaces",
+        [] (int64_t) {
+            enumerateNetworkInterfaces();
+            throw CLI::Success();
+        }, "Enumerate network interfaces")
+        ->trigger_on_parse();
+
+    app.add_option("-i,--inputDeviceIndex", opts.inputDeviceIndex, "Index of the audio input device")
+        ->required();
     app.add_option("-n,--networkInterface", opts.networkInterface, "Network interface");
     app.add_option("-L,--latency", opts.latencyMs,
                    "Milliseconds from capture to the receivers' speakers, the same for every receiver")
         ->check(CLI::PositiveNumber);
 
+    // What CLI11_PARSE expands to; CLI::Success from the flags above lands here too.
     try {
         app.parse(argc, argv);
     } catch (const CLI::ParseError& e) {
@@ -161,19 +197,26 @@ std::optional<int> parseOptions(int argc, char** argv, Options& opts) {
 }
 
 int main(int argc, char** argv) {
+    AudioContext audio;
+    if (!audio.init()) {
+        std::cerr << "Failed to initialise the audio context\n";
+        return 2;
+    }
+    if (audio.captureCount() == 0) {
+        std::cerr << "No audio capture devices available\n";
+        return 2;
+    }
+
     Options opts;
-    if (const auto exitCode = parseOptions(argc, argv, opts)) {
+    if (const auto exitCode = parseOptions(argc, argv, audio, opts)) {
         return *exitCode;
     }
 
-    const auto all = net::enumerate();
-    std::cout << "interfaces:\n";
-    for (const auto& i : all) {
-        std::cout << "  " << i.name << "  " << i.address.to_string()
-                  << "  idx=" << i.index;
-        if (!i.description.empty()) std::cout << "  (" << i.description << ")";
-        std::cout << "\n";
+    if (opts.inputDeviceIndex >= audio.captureCount()) {
+        std::cerr << "Input device with index " << opts.inputDeviceIndex << " not available\n";
+        return 2;
     }
+
     const auto chosen = !opts.networkInterface.empty() ? net::find(opts.networkInterface) : net::selectDefault();
     if (!chosen) {
         std::cerr << (!opts.networkInterface.empty() ? "no such interface\n"
@@ -205,21 +248,6 @@ int main(int argc, char** argv) {
     }
     std::cout << "clock-sync master on " << kClockGroup << ":" << kClockPort << "\n";
 
-    AudioContext audio;
-    if (!audio.init()) {
-        std::cerr << "Failed to initialise the audio context\n";
-        return 2;
-    }
-    if (audio.captureCount() == 0) {
-        std::cerr << "No audio capture devices available\n";
-        return 2;
-    }
-    for (ma_uint32 deviceIndex = 0; deviceIndex < audio.captureCount(); deviceIndex += 1) {
-        const ma_device_info& info = audio.captureInfo(deviceIndex);
-        std::cout << deviceIndex << " - " << info.name
-                  << (info.isDefault ? " (default)" : "") << "\n";
-    }
-
     SenderContext ctx;
     ctx.origin = Clock::now();
     ctx.originNs = toNanos(ctx.origin);
@@ -234,9 +262,9 @@ int main(int argc, char** argv) {
     recorderConfig.periods            = kNumPeriods;
 
     AudioRecorder recorder;
-    if (!recorder.open(audio, audio.captureInfo(kCaptureDeviceIndex).id, recorderConfig,
+    if (!recorder.open(audio, audio.captureInfo(opts.inputDeviceIndex).id, recorderConfig,
                        data_callback, &ctx)) {
-        std::cerr << "Failed to open the capture device\n";
+        std::cerr << "Failed to open the selected input device\n";
         return 2;
     }
 
