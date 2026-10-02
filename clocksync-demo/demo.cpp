@@ -147,14 +147,7 @@ int main(int argc, char** argv) {
     // which binds the socket and joins the multicast group, both fail with an
     // asio::system_error on a busy port or an interface that cannot join.
     try {
-        const auto all = net::enumerate();
-        std::cout << "interfaces:\n";
-        for (const auto& i : all) {
-            std::cout << "  " << i.name << "  " << i.address.to_string()
-                      << "  idx=" << i.index;
-            if (!i.description.empty()) std::cout << "  (" << i.description << ")";
-            std::cout << "\n";
-        }
+        net::printInterfaces(std::cout);
         const auto chosen = ifName.empty() ? net::selectDefault() : net::find(ifName);
         if (!chosen) {
             std::cerr << (ifName.empty() ? "ambiguous or none; name one explicitly\n"

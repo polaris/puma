@@ -13,6 +13,8 @@
 #include "clock_sync.h"
 #include "netint.h"
 #include "packet_ring.h"
+#include "shutdown_signal.h"
+#include "stream_defaults.h"
 #include "thread_priority.h"
 #include "time_filter.h"
 
@@ -36,9 +38,13 @@ using Clock = std::chrono::steady_clock;
 using asio::ip::udp;
 
 using streaming::kAudioPacketHeaderBytes;
-
-constexpr ma_uint32   kPeriodSizeInFrames = 240;
-constexpr ma_uint32   kNumPeriods = 3;
+using streaming::kBandwidth;
+using streaming::kClockGroup;
+using streaming::kClockPort;
+using streaming::kNumPeriods;
+using streaming::kPeriodSizeInFrames;
+using streaming::kStartBandwidth;
+using streaming::kStartSeconds;
 
 // CPU the send thread needs per packet, at most; for the real-time scheduler.
 constexpr auto kSendComputation = std::chrono::microseconds(500);
@@ -47,17 +53,6 @@ constexpr auto kSendComputation = std::chrono::microseconds(500);
 // delay plus each receiver's output latency; what is left, receivers spend
 // waiting in their ring.
 constexpr double kDefaultLatencyMs = 100.0;
-
-// The capture clock's smoothing: fast at first, so the timeline settles
-// quickly, then slow, so the stamps carry as little callback jitter as possible.
-constexpr double kStartBandwidth = 1.0;    // Hz
-constexpr double kBandwidth = 0.05;        // Hz
-constexpr double kStartSeconds = 4.0;
-
-constexpr std::string_view kAudioGroup = "239.255.0.1";
-constexpr unsigned short kAudioPort = 12345;
-constexpr std::string_view kClockGroup = "239.255.0.2";    // not the audio group
-constexpr unsigned short kClockPort = 12346;
 
 struct SenderContext {
     PacketRing ring;
@@ -79,7 +74,7 @@ struct SenderContext {
 
 // Smoothed start time of this callback, in seconds since origin. The raw
 // callback times are bursty; every receiver steers toward the stamps, so they
-// have to lie on a smooth line.
+// have to lie on a smooth line, with as little callback jitter as possible.
 [[nodiscard]] static double trackCaptureClock(SenderContext& ctx, ma_uint32 frameCount) {
     const double t = std::chrono::duration<double>(Clock::now() - ctx.origin).count();
 
@@ -137,8 +132,10 @@ void data_callback(void* user, const void* input, ma_uint32 frameCount) {
 
 struct Options {
     unsigned int inputDeviceIndex = 0;
-    std::string networkInterface;
     double latencyMs = kDefaultLatencyMs;
+    std::string networkInterface;
+    std::string multicastGroup{streaming::kDefaultAudioGroup};
+    unsigned short multicastPort = streaming::kDefaultAudioPort;
 };
 
 void enumerateInputDevices(const AudioContext& audio) {
@@ -146,18 +143,6 @@ void enumerateInputDevices(const AudioContext& audio) {
         const ma_device_info& info = audio.captureInfo(deviceIndex);
         std::cout << deviceIndex << " - " << info.name
                   << (info.isDefault ? " (default)" : "") << "\n";
-    }
-}
-
-void enumerateNetworkInterfaces() {
-    const auto all = net::enumerate();
-    std::cout << "interfaces:\n";
-    for (const auto& i : all) {
-        std::cout << "  " << i.name << "  " << i.address.to_string() << "  idx=" << i.index;
-        if (!i.description.empty()) {
-            std::cout << "  (" << i.description << ")";
-        }
-        std::cout << "\n";
     }
 }
 
@@ -175,17 +160,20 @@ std::optional<int> parseOptions(int argc, char** argv, const AudioContext& audio
         ->trigger_on_parse();
     app.add_flag("--enumNetworkInterfaces",
         [] (int64_t) {
-            enumerateNetworkInterfaces();
+            net::printInterfaces(std::cout);
             throw CLI::Success();
         }, "Enumerate network interfaces")
         ->trigger_on_parse();
 
     app.add_option("-i,--inputDeviceIndex", opts.inputDeviceIndex, "Index of the audio input device")
         ->required();
-    app.add_option("-n,--networkInterface", opts.networkInterface, "Network interface");
     app.add_option("-L,--latency", opts.latencyMs,
                    "Milliseconds from capture to the receivers' speakers, the same for every receiver")
         ->check(CLI::PositiveNumber);
+    app.add_option("-n,--networkInterface", opts.networkInterface, "Network interface");
+    app.add_option("-m,--multicastGroup", opts.multicastGroup, "Multicast group address")
+        ->check(CLI::ValidIPV4);
+    app.add_option("-p,--multicastPort", opts.multicastPort, "Multicast port");
 
     // What CLI11_PARSE expands to; CLI::Success from the flags above lands here too.
     try {
@@ -205,19 +193,10 @@ std::optional<net::Interface> openSocket(udp::socket& tx, const Options& opts) {
     }
     std::cout << "Using network interface " << chosen->name << " " << chosen->address.to_string() << "\n";
 
-    const udp::endpoint group(asio::ip::make_address(kAudioGroup), kAudioPort);
+    const udp::endpoint group(asio::ip::make_address(opts.multicastGroup), opts.multicastPort);
     net::configureSender(tx, group, *chosen, {.hops = 1, .loopback = true});
     std::cout << "Sender configured\n";
     return chosen;
-}
-
-// Runs `control` on the calling thread until SIGINT or SIGTERM.
-void runUntilShutdownSignal(asio::io_context& control) {
-    asio::signal_set signals{control, SIGINT, SIGTERM};
-    signals.async_wait([&](auto, int) {
-        control.stop();
-    });
-    control.run();
 }
 
 int main(int argc, char** argv) {
@@ -253,11 +232,10 @@ int main(int argc, char** argv) {
     // throw on failure.
     std::optional<clocksync::ClockSync> clockMaster;
     try {
-        std::random_device rd;
         clockMaster.emplace(clocksync::Config{
             .group = asio::ip::udp::endpoint(asio::ip::make_address(kClockGroup), kClockPort),
             .iface = *iface,
-            .nodeId = (static_cast<std::uint64_t>(rd()) << 32) | rd(),
+            .nodeId = clocksync::randomNodeId(),
         }, clocksync::Role::Master);
     } catch (const std::exception& e) {
         std::cerr << "Failed to set up the clock-sync master: " << e.what() << "\n";

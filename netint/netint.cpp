@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <ostream>
 #include <tuple>
 
 #if defined(_WIN32)
@@ -119,6 +120,17 @@ std::vector<Interface> enumerate() {
         return std::tie(a.name, a.address) < std::tie(b.name, b.address);
     });
     return out;
+}
+
+void printInterfaces(std::ostream& out) {
+    out << "interfaces:\n";
+    for (const auto& i : enumerate()) {
+        out << "  " << i.name << "  " << i.address.to_string() << "  idx=" << i.index;
+        if (!i.description.empty()) {
+            out << "  (" << i.description << ")";
+        }
+        out << "\n";
+    }
 }
 
 std::optional<Interface> find(std::string_view wanted) {

@@ -1,6 +1,7 @@
 #ifndef NET_NETINT_H
 #define NET_NETINT_H
 
+#include <iosfwd>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -23,6 +24,9 @@ struct Interface {
 /// Sorted by name then address so the order is reproducible.
 /// Returns an empty vector if enumeration fails.
 [[nodiscard]] std::vector<Interface> enumerate();
+
+/// Writes enumerate()'s result to `out`, one interface per line.
+void printInterfaces(std::ostream& out);
 
 /// Match by name, by description, or by dotted-quad address.
 [[nodiscard]] std::optional<Interface> find(std::string_view wanted);

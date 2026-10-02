@@ -25,6 +25,11 @@ void prioritizeCurrentThread() {
 
 } // namespace
 
+std::uint64_t randomNodeId() {
+    std::random_device rd;
+    return (static_cast<std::uint64_t>(rd()) << 32) | rd();
+}
+
 ClockSync::ClockSync(Config config, Role role)
 : socket_{io_}
 , timer_{io_}
