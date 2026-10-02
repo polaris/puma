@@ -164,10 +164,10 @@ int main(int argc, char** argv) {
         std::cout << "using " << chosen->name << " " << chosen->address.to_string() << "\n";
 
         clocksync::Config config{
-            .group = asio::ip::udp::endpoint(asio::ip::make_address(group), port),
+            .group = asio::ip::udp::endpoint(asio::ip::make_address(group), static_cast<asio::ip::port_type>(port)),
             .iface = *chosen,
-            .nodeId = nodeId,
             .domain = static_cast<std::uint8_t>(domain),
+            .nodeId = nodeId,
             .syncInterval = std::chrono::milliseconds{syncInterval},
             .delayReqInterval = std::chrono::milliseconds{delayReqInterval},
             .acquireBandwidth = acquireBandwidth,
