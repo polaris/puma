@@ -57,12 +57,13 @@ public:
         // report at the start, past the newest when the stream stops.
         const NetReport& a = at(0);
         const NetReport& b = at(1);
-        if (!(b.t > a.t)) {
+        const double span = b.t - a.t;
+        if (!(span > 0.0)) {
             return std::nullopt;
         }
         // Integer subtraction first: the positions are too large for a double.
         return static_cast<double>(static_cast<std::int64_t>(a.k - k))
-             + static_cast<double>(b.k - a.k) * (m - a.t) / (b.t - a.t);
+             + static_cast<double>(b.k - a.k) * (m - a.t) / span;
     }
 
     [[nodiscard]] std::size_t size() const noexcept {
