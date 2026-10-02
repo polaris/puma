@@ -31,8 +31,10 @@
 #include "rate_loop.h"
 #include "receive_stats.h"
 #include "resampler.h"
+#include "shutdown_signal.h"
 #include "spsc_ring.h"
 #include "status_reporter.h"
+#include "stream_defaults.h"
 #include "thread_priority.h"
 #include "time_filter.h"
 #include "frame_ring.h"
@@ -40,17 +42,16 @@
 using asio::ip::udp;
 using Clock = std::chrono::steady_clock;
 
-// The device's and the arrivals' smoothing: fast for the first seconds after
-// a (re)start, so start-up bursts settle quickly, then slow.
-constexpr double kBandwidth = 0.05;        // Hz
-constexpr double kStartBandwidth = 1.0;    // Hz
-constexpr double kStartSeconds = 4.0;
-constexpr std::string_view kDefaultMulticastGroup = "239.255.0.1";
-constexpr unsigned short kDefaultMulticastPort = 12345;
-constexpr unsigned int kDefaultSampleRate = 48000;
-constexpr unsigned int kPeriodSizeInFrames = 240;
-constexpr unsigned int kNumPeriods = 3;
 using streaming::kAudioPacketHeaderBytes;
+using streaming::kBandwidth;
+using streaming::kClockGroup;
+using streaming::kClockPort;
+using streaming::kNumPeriods;
+using streaming::kPeriodSizeInFrames;
+using streaming::kStartBandwidth;
+using streaming::kStartSeconds;
+
+constexpr unsigned int kDefaultSampleRate = 48000;
 
 // Frames wait here from arrival until their presentation time, about the
 // sender's latency L: ~170 ms, enough for L up to about 150 ms.
@@ -67,9 +68,6 @@ constexpr double kDefaultOutputLatencyMs = 0.0;
 
 // Further off than this, the receiver re-aligns instead of steering back.
 constexpr double kRealignMs = 5.0;
-
-constexpr std::string_view kClockGroup = "239.255.0.2";    // the sender is the master
-constexpr unsigned short kClockPort = 12346;
 
 // CPU the receive thread needs per packet, at most; for the real-time scheduler.
 constexpr auto kReceiveComputation = std::chrono::microseconds(500);
@@ -454,8 +452,8 @@ struct Options {
     unsigned int periodSizeInFrames = kPeriodSizeInFrames;
     double outputLatencyMs = kDefaultOutputLatencyMs;
     std::string networkInterface;
-    std::string multicastGroup{kDefaultMulticastGroup};
-    unsigned short multicastPort = kDefaultMulticastPort;
+    std::string multicastGroup{streaming::kDefaultAudioGroup};
+    unsigned short multicastPort = streaming::kDefaultAudioPort;
 };
 
 void enumerateOutputDevices(const AudioContext& audio) {
@@ -463,18 +461,6 @@ void enumerateOutputDevices(const AudioContext& audio) {
         const ma_device_info& info = audio.playbackInfo(deviceIndex);
         std::cout << deviceIndex << " - " << info.name
                   << (info.isDefault ? " (default)" : "") << "\n";
-    }
-}
-
-void enumerateNetworkInterfaces() {
-    const auto all = net::enumerate();
-    std::cout << "interfaces:\n";
-    for (const auto &i : all) {
-        std::cout << "  " << i.name << "  " << i.address.to_string() << "  idx=" << i.index;
-        if (!i.description.empty()) {
-            std::cout << "  (" << i.description << ")";
-        }
-        std::cout << "\n";
     }
 }
 
@@ -492,7 +478,7 @@ std::optional<int> parseOptions(int argc, char** argv, const AudioContext& audio
         ->trigger_on_parse();
     app.add_flag("--enumNetworkInterfaces",
         [] (int64_t) {
-            enumerateNetworkInterfaces();
+            net::printInterfaces(std::cout);
             throw CLI::Success();
         }, "Enumerate network interfaces")
         ->trigger_on_parse();
@@ -535,15 +521,6 @@ std::optional<net::Interface> openSocket(udp::socket& rx, const Options& opts) {
     return chosen;
 }
 
-// Runs `control` on the calling thread until SIGINT or SIGTERM.
-void runUntilShutdownSignal(asio::io_context& control) {
-    asio::signal_set signals{control, SIGINT, SIGTERM};
-    signals.async_wait([&](auto, int) {
-        control.stop();
-    });
-    control.run();
-}
-
 int main(int argc, char** argv) {
     AudioContext audio;
     if (!audio.init()) {
@@ -576,11 +553,10 @@ int main(int argc, char** argv) {
     // Binding the socket and joining the group throw on failure.
     std::optional<clocksync::ClockSync> clock;
     try {
-        std::random_device rd;
         clock.emplace(clocksync::Config{
             .group = udp::endpoint(asio::ip::make_address(kClockGroup), kClockPort),
             .iface = *iface,
-            .nodeId = (static_cast<std::uint64_t>(rd()) << 32) | rd(),
+            .nodeId = clocksync::randomNodeId(),
         }, clocksync::Role::Slave);
     } catch (const std::exception& e) {
         std::cerr << "Failed to set up the clock-sync slave: " << e.what() << "\n";

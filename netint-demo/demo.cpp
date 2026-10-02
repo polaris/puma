@@ -2,14 +2,7 @@
 #include <iostream>
 
 int main(int argc, char** argv) {
-    const auto all = net::enumerate();
-    std::cout << "interfaces:\n";
-    for (const auto& i : all) {
-        std::cout << "  " << i.name << "  " << i.address.to_string()
-                  << "  idx=" << i.index;
-        if (!i.description.empty()) std::cout << "  (" << i.description << ")";
-        std::cout << "\n";
-    }
+    net::printInterfaces(std::cout);
     const auto chosen = argc > 1 ? net::find(argv[1]) : net::selectDefault();
     if (!chosen) {
         std::cerr << (argc > 1 ? "no such interface\n"

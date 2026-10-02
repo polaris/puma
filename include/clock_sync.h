@@ -66,6 +66,9 @@ struct Sample {
     std::uint64_t tooSoon;
 };
 
+// A fresh 64-bit Config::nodeId, so each run tells its own packets apart.
+[[nodiscard]] std::uint64_t randomNodeId();
+
 struct Config {
     asio::ip::udp::endpoint group;        // 239.255.0.2:12346 — not the audio group
     net::Interface iface;                 // Network interface
