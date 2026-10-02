@@ -196,6 +196,21 @@ std::optional<int> parseOptions(int argc, char** argv, const AudioContext& audio
     return std::nullopt;
 }
 
+// Returns the interface it chose, for the clock sync to use too.
+std::optional<net::Interface> openSocket(udp::socket& tx, const Options& opts) {
+    const auto chosen = !opts.networkInterface.empty() ? net::find(opts.networkInterface) : net::selectDefault();
+    if (!chosen) {
+        std::cerr << (!opts.networkInterface.empty() ? "No such interface\n" : "Ambiguous or none; name one explicitly\n");
+        return std::nullopt;
+    }
+    std::cout << "Using network interface " << chosen->name << " " << chosen->address.to_string() << "\n";
+
+    const udp::endpoint group(asio::ip::make_address(kAudioGroup), kAudioPort);
+    net::configureSender(tx, group, *chosen, {.hops = 1, .loopback = true});
+    std::cout << "Sender configured\n";
+    return chosen;
+}
+
 int main(int argc, char** argv) {
     AudioContext audio;
     if (!audio.init()) {
@@ -217,19 +232,12 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    const auto chosen = !opts.networkInterface.empty() ? net::find(opts.networkInterface) : net::selectDefault();
-    if (!chosen) {
-        std::cerr << (!opts.networkInterface.empty() ? "no such interface\n"
-                                                     : "ambiguous or none; name one explicitly\n");
+    asio::io_context io;
+    udp::socket tx(io);
+    const auto iface = openSocket(tx, opts);
+    if (!iface) {
         return 1;
     }
-    std::cout << "using " << chosen->name << " " << chosen->address.to_string() << "\n";
-
-    const asio::ip::udp::endpoint group(asio::ip::make_address(kAudioGroup), kAudioPort);
-    asio::io_context io;
-    asio::ip::udp::socket tx(io);
-    net::configureSender(tx, group, *chosen, {.hops = 1, .loopback = true});
-    std::cout << "Sender configured\n";
 
     // The sender is the clock-sync master: its steady clock is master time, so
     // the stamps need no conversion. Binding the socket and joining the group
@@ -239,7 +247,7 @@ int main(int argc, char** argv) {
         std::random_device rd;
         clockMaster.emplace(clocksync::Config{
             .group = asio::ip::udp::endpoint(asio::ip::make_address(kClockGroup), kClockPort),
-            .iface = *chosen,
+            .iface = *iface,
             .nodeId = (static_cast<std::uint64_t>(rd()) << 32) | rd(),
         }, clocksync::Role::Master);
     } catch (const std::exception& e) {
