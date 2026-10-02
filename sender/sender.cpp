@@ -13,11 +13,13 @@
 #include "clock_sync.h"
 #include "netint.h"
 #include "packet_ring.h"
+#include "send_stats.h"
 #include "shutdown_signal.h"
 #include "stream_defaults.h"
 #include "thread_priority.h"
 #include "time_filter.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -54,81 +56,147 @@ constexpr auto kSendComputation = std::chrono::microseconds(500);
 // waiting in their ring.
 constexpr double kDefaultLatencyMs = 100.0;
 
-struct SenderContext {
-    PacketRing ring;
-    std::counting_semaphore<> wake{0};
-    std::atomic<bool> running{true};
-    std::atomic<std::uint64_t> dropped{0};
-    std::atomic<std::uint64_t> oversize{0};
-    Clock::time_point origin;
-    std::uint64_t originNs = 0;      // origin in master time: ns since the steady clock's epoch
-    double latency = 0.0;            // L, seconds from capture to the receivers' speakers
+// Audio thread -> send thread: one encoded packet per capture callback.
+using PacketsReady = std::counting_semaphore<>;
+
+struct CaptureState {
     unsigned int sampleRate = 0;
-    std::uint32_t session = 0;       // new for every run, so receivers can tell a restart from loss
     std::size_t bytesPerFrame = 0;
+    double latency = 0.0;               // L, seconds from capture to the receivers' speakers
+
+    PacketRing* ring = nullptr;
+    PacketsReady* ready = nullptr;
+    CaptureStats* stats = nullptr;
+
+    Clock::time_point origin;
+    std::uint64_t originNs = 0;         // origin in master time: ns since the steady clock's epoch
 
     // Audio thread only.
+    std::uint32_t session = 0;          // new for every run, so receivers can tell a restart from loss
     std::uint32_t sequence = 0;
-    TimeFilter filter{};
+    TimeFilter timeFilter{};
 };
+
+void printSendStats(const SendStats& stats, const CaptureStats& capture) {
+    std::cerr << "dropped packets " << capture.droppedPackets.load()
+              << ", oversize packets " << capture.oversizePackets.load()
+              << ", send errors " << stats.sendErrors
+              << ", ring high water " << stats.ringHighWater
+              << "\n";
+    if (stats.lastSendError) {
+        std::cerr << "last send error: " << stats.lastSendError.message() << "\n";
+    }
+}
 
 // Smoothed start time of this callback, in seconds since origin. The raw
 // callback times are bursty; every receiver steers toward the stamps, so they
 // have to lie on a smooth line, with as little callback jitter as possible.
-[[nodiscard]] static double trackCaptureClock(SenderContext& ctx, ma_uint32 frameCount) {
-    const double t = std::chrono::duration<double>(Clock::now() - ctx.origin).count();
+[[nodiscard]] static double trackCaptureClock(CaptureState& s, ma_uint32 frameCount) {
+    const double t = std::chrono::duration<double>(Clock::now() - s.origin).count();
 
     // Also true on the first call. The filter assumes a fixed callback size,
     // so a change starts it over, and a new session with it: receivers then
     // re-align to the new timeline instead of following a jump in it.
-    if (frameCount != ctx.filter.framesPerPeriod()) {
-        if (ctx.filter.framesPerPeriod() != 0) {
-            ++ctx.session;
+    if (frameCount != s.timeFilter.framesPerPeriod()) {
+        if (s.timeFilter.framesPerPeriod() != 0) {
+            ++s.session;
         }
-        ctx.filter.configure(kBandwidth, frameCount, ctx.sampleRate, kStartBandwidth, kStartSeconds);
-        ctx.filter.reset(t);
-        return ctx.filter.time();
+        s.timeFilter.configure(kBandwidth, frameCount, s.sampleRate, kStartBandwidth, kStartSeconds);
+        s.timeFilter.reset(t);
+        return s.timeFilter.time();
     }
 
-    ctx.filter.update(t);
-    return ctx.filter.time();
+    s.timeFilter.update(t);
+    return s.timeFilter.time();
 }
 
-void data_callback(void* user, const void* input, ma_uint32 frameCount) {
-    auto* ctx = static_cast<SenderContext*>(user);
+// Every callback stamps its frames with the time they are to be heard and
+// hands them to the send thread as one packet.
+static void onCapture(void* user, const void* input, ma_uint32 frameCount) {
+    auto& s = *static_cast<CaptureState*>(user);
 
     // First, so the timeline runs on through dropped packets.
-    const double captured = trackCaptureClock(*ctx, frameCount);
+    const double captured = trackCaptureClock(s, frameCount);
 
-    const std::size_t payload = kAudioPacketHeaderBytes + frameCount * ctx->bytesPerFrame;
+    const std::size_t payload = kAudioPacketHeaderBytes + frameCount * s.bytesPerFrame;
     if (payload > kMaxPayload) {
-        ctx->oversize.fetch_add(1, std::memory_order_relaxed);
+        s.stats->oversizePackets.fetch_add(1, std::memory_order_relaxed);
         return;
     }
- 
-    Slot* slot = ctx->ring.claim();
+
+    Slot* slot = s.ring->claim();
     if (!slot) {
-        ctx->dropped.fetch_add(1, std::memory_order_relaxed);
-        ++ctx->sequence;
+        s.stats->droppedPackets.fetch_add(1, std::memory_order_relaxed);
+        ++s.sequence;
         return;
     }
- 
+
     const streaming::AudioPacketHeader header{
-        .session = ctx->session,
-        .seq     = ctx->sequence++,
+        .session = s.session,
+        .seq     = s.sequence++,
         .frames  = frameCount,
-        .t       = ctx->originNs + static_cast<std::uint64_t>(std::llround((captured + ctx->latency) * 1e9)),
+        .t       = s.originNs + static_cast<std::uint64_t>(std::llround((captured + s.latency) * 1e9)),
     };
     std::uint8_t encoded[kAudioPacketHeaderBytes];
     streaming::encodeAudioPacketHeader(header, encoded);
 
     std::memcpy(slot->data.data(), encoded, kAudioPacketHeaderBytes);
-    std::memcpy(slot->data.data() + kAudioPacketHeaderBytes, input, frameCount * ctx->bytesPerFrame);
+    std::memcpy(slot->data.data() + kAudioPacketHeaderBytes, input, frameCount * s.bytesPerFrame);
     slot->length = static_cast<std::uint32_t>(payload);
- 
-    ctx->ring.commit();
-    ctx->wake.release();
+
+    s.ring->commit();
+    s.ready->release();
 }
+
+// Sends what the capture callback queues, on a thread of its own: a blocking
+// send per packet, woken once per packet.
+class PacketSender {
+public:
+    PacketSender(udp::socket& tx, PacketRing& ring, PacketsReady& ready, SendStats& stats)
+    : tx_{tx}
+    , ring_{ring}
+    , ready_{ready}
+    , stats_{stats} {
+    }
+
+    PacketSender(const PacketSender&) = delete;
+    PacketSender& operator=(const PacketSender&) = delete;
+
+    // The send thread's body; returns once stop() is called.
+    void run() {
+        while (running_.load(std::memory_order_relaxed)) {
+            ready_.acquire();
+            stats_.ringHighWater = std::max(stats_.ringHighWater, ring_.size());
+            while (const Slot* slot = ring_.front()) {
+                send(*slot);
+                ring_.pop();
+            }
+        }
+    }
+
+    // From any thread. Packets queued after the last wake-up are not sent.
+    void stop() {
+        running_.store(false, std::memory_order_relaxed);
+        ready_.release();
+    }
+
+private:
+    void send(const Slot& slot) {
+        asio::error_code ec;
+        tx_.send(asio::buffer(slot.data.data(), slot.length), 0, ec);
+        if (ec) {
+            ++stats_.sendErrors;
+            stats_.lastSendError = ec;
+        }
+    }
+
+    udp::socket& tx_;
+    PacketRing& ring_;
+    PacketsReady& ready_;
+    SendStats& stats_;
+
+    std::atomic<bool> running_{true};
+};
 
 struct Options {
     unsigned int inputDeviceIndex = 0;
@@ -243,22 +311,33 @@ int main(int argc, char** argv) {
     }
     std::cout << "clock-sync master on " << kClockGroup << ":" << kClockPort << "\n";
 
-    SenderContext ctx;
-    ctx.origin = Clock::now();
-    ctx.originNs = toNanos(ctx.origin);
-    ctx.latency = opts.latencyMs / 1000.0;
-    ctx.session = std::random_device{}();
+    AudioRecorder::Config recorderConfig {
+        .format = ma_format_s16,
+        .channels = 0,      // native
+        .sampleRate = 0,    // native: the sender defines the rate
+        .periodSizeInFrames = kPeriodSizeInFrames,
+        .periods = kNumPeriods,
+    };
 
-    AudioRecorder::Config recorderConfig;
-    recorderConfig.format             = ma_format_s16;
-    recorderConfig.channels           = 0;      // native
-    recorderConfig.sampleRate         = 0;      // native: the sender defines the rate
-    recorderConfig.periodSizeInFrames = kPeriodSizeInFrames;
-    recorderConfig.periods            = kNumPeriods;
+    PacketRing packetRing;
+    PacketsReady ready{0};
+    SendStats stats;
+    CaptureStats captureStats;
+
+    const auto origin = Clock::now();
+
+    CaptureState state{
+        .latency = opts.latencyMs / 1000.0,
+        .ring = &packetRing,
+        .ready = &ready,
+        .stats = &captureStats,
+        .origin = origin,
+        .originNs = toNanos(origin),
+        .session = std::random_device{}(),
+    };
 
     AudioRecorder recorder;
-    if (!recorder.open(audio, audio.captureInfo(opts.inputDeviceIndex).id, recorderConfig,
-                       data_callback, &ctx)) {
+    if (!recorder.open(audio, audio.captureInfo(opts.inputDeviceIndex).id, recorderConfig, onCapture, &state)) {
         std::cerr << "Failed to open the selected input device\n";
         return 2;
     }
@@ -277,44 +356,25 @@ int main(int argc, char** argv) {
 
     std::cout << "latency " << opts.latencyMs << " ms\n";
 
-    // The callback reads these, so they have to be set before start().
-    ctx.bytesPerFrame = recorder.bytesPerFrame();
-    ctx.sampleRate = recorder.sampleRate();
-    if (kAudioPacketHeaderBytes + kPeriodSizeInFrames * ctx.bytesPerFrame > kMaxPayload) {
+    // Everything the audio callback touches has to be in place before start().
+    const std::size_t bytesPerFrame = recorder.bytesPerFrame();
+    if (kAudioPacketHeaderBytes + kPeriodSizeInFrames * bytesPerFrame > kMaxPayload) {
         std::cerr << "payload too large for slot\n";
         return 3;
     }
+    state.sampleRate = recorder.sampleRate();
+    state.bytesPerFrame = bytesPerFrame;
 
-    // Written by the worker only, read after it is joined.
-    std::size_t highWater = 0;
-    std::uint64_t sendErrors = 0;
-    asio::error_code lastSendError;
+    PacketSender sender(tx, packetRing, ready, stats);
 
     const auto packetPeriod = std::chrono::nanoseconds(
         std::chrono::seconds(kPeriodSizeInFrames)) / recorder.sampleRate();
     std::promise<bool> realtime;
     std::future<bool> realtimeResult = realtime.get_future();
-
-    std::thread worker([&ctx, &tx, &highWater, &sendErrors, &lastSendError, &realtime, packetPeriod]() {
+    std::thread worker([&]{
         realtime.set_value(rt::makeCurrentThreadRealtime(packetPeriod, kSendComputation));
-        while (ctx.running.load(std::memory_order_relaxed)) {
-            ctx.wake.acquire();
-            const auto d = ctx.ring.size();
-            if (d > highWater) {
-                highWater = d;
-            }
-            while (const Slot* slot = ctx.ring.front()) {
-                asio::error_code ec;
-                tx.send(asio::buffer(slot->data.data(), slot->length), 0, ec);
-                if (ec) {
-                    ++sendErrors;
-                    lastSendError = ec;
-                }
-                ctx.ring.pop();
-            }
-        }
+        sender.run();
     });
- 
     if (!realtimeResult.get()) {
         std::cerr << "Could not give the send thread real-time priority; it runs at normal priority\n";
     }
@@ -328,8 +388,7 @@ int main(int argc, char** argv) {
     // drop the opening packets. That is what makes this failure path join.
     if (!recorder.start()) {
         std::cerr << "Failed to start the capture device\n";
-        ctx.running.store(false);
-        ctx.wake.release();
+        sender.stop();
         worker.join();
         return 4;
     }
@@ -340,16 +399,12 @@ int main(int argc, char** argv) {
 
     // Producer first, then the consumer it feeds.
     recorder.stop();
-    ctx.running.store(false);
-    ctx.wake.release();
+    sender.stop();
     worker.join();
     tx.close();
     clockMaster->stop();
- 
-    std::cerr << "dropped " << ctx.dropped.load() << ", oversize " << ctx.oversize.load()
-              << ", send errors " << sendErrors << ", high water " << highWater << "\n";
-    if (lastSendError) {
-        std::cerr << "last send error: " << lastSendError.message() << "\n";
-    }
+
+    printSendStats(stats, captureStats);
+
     return 0;
 }
