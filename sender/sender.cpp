@@ -211,6 +211,15 @@ std::optional<net::Interface> openSocket(udp::socket& tx, const Options& opts) {
     return chosen;
 }
 
+// Runs `control` on the calling thread until SIGINT or SIGTERM.
+void runUntilShutdownSignal(asio::io_context& control) {
+    asio::signal_set signals{control, SIGINT, SIGTERM};
+    signals.async_wait([&](auto, int) {
+        control.stop();
+    });
+    control.run();
+}
+
 int main(int argc, char** argv) {
     AudioContext audio;
     if (!audio.init()) {
@@ -298,14 +307,17 @@ int main(int argc, char** argv) {
         return 3;
     }
 
+    // Written by the worker only, read after it is joined.
     std::size_t highWater = 0;
- 
+    std::uint64_t sendErrors = 0;
+    asio::error_code lastSendError;
+
     const auto packetPeriod = std::chrono::nanoseconds(
         std::chrono::seconds(kPeriodSizeInFrames)) / recorder.sampleRate();
     std::promise<bool> realtime;
     std::future<bool> realtimeResult = realtime.get_future();
 
-    std::thread worker([&ctx, &tx, &highWater, &realtime, packetPeriod]() {
+    std::thread worker([&ctx, &tx, &highWater, &sendErrors, &lastSendError, &realtime, packetPeriod]() {
         realtime.set_value(rt::makeCurrentThreadRealtime(packetPeriod, kSendComputation));
         while (ctx.running.load(std::memory_order_relaxed)) {
             ctx.wake.acquire();
@@ -317,7 +329,8 @@ int main(int argc, char** argv) {
                 asio::error_code ec;
                 tx.send(asio::buffer(slot->data.data(), slot->length), 0, ec);
                 if (ec) {
-                    std::cerr << "send: " << ec.message() << "\n";
+                    ++sendErrors;
+                    lastSendError = ec;
                 }
                 ctx.ring.pop();
             }
@@ -342,7 +355,10 @@ int main(int argc, char** argv) {
         worker.join();
         return 4;
     }
-    std::cin.get();
+
+    // The main thread only waits for signals; packets never wait for it.
+    asio::io_context control;
+    runUntilShutdownSignal(control);
 
     // Producer first, then the consumer it feeds.
     recorder.stop();
@@ -352,6 +368,10 @@ int main(int argc, char** argv) {
     tx.close();
     clockMaster->stop();
  
-    std::cerr << "dropped " << ctx.dropped.load() << ", oversize " << ctx.oversize.load() <<  ", high water " << highWater << "\n";
+    std::cerr << "dropped " << ctx.dropped.load() << ", oversize " << ctx.oversize.load()
+              << ", send errors " << sendErrors << ", high water " << highWater << "\n";
+    if (lastSendError) {
+        std::cerr << "last send error: " << lastSendError.message() << "\n";
+    }
     return 0;
 }
